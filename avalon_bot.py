@@ -235,14 +235,23 @@ class AvalonBot:
         self.stats = {}         # authoritative stats from `welcome`/`playerStats`
 
     async def send(self, msg):
-        """JSON for everything except move/attack, which are binary."""
+        """JSON for everything except move/attack, which are binary.
+
+        A send racing a close (a one-shot intent that just told the socket to
+        close, while a final snapshot is still in flight) is expected and
+        harmless -- swallow it rather than crashing on the way out."""
+        import websockets
+
         t = msg.get("type")
-        if t == "move":
-            await self.ws.send(encode_move(msg["dx"], msg["dy"]))
-        elif t == "attack":
-            await self.ws.send(encode_attack(msg["targetId"]))
-        else:
-            await self.ws.send(json.dumps(msg))
+        try:
+            if t == "move":
+                await self.ws.send(encode_move(msg["dx"], msg["dy"]))
+            elif t == "attack":
+                await self.ws.send(encode_attack(msg["targetId"]))
+            else:
+                await self.ws.send(json.dumps(msg))
+        except websockets.exceptions.ConnectionClosed:
+            pass
 
     # convenience wrappers -- the full verb list is in the module docstring
     async def move(self, dx, dy):

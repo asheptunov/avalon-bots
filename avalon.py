@@ -181,69 +181,73 @@ HEAL_POTIONS = [("healthPotion", 30), ("largeHealthPotion", 60)]
 HEALER_NAMES = {"brother aldric", "aldric"}
 
 
-async def intent_heal(bot, snap):
-    """Heal to full. Prefer drinking a health potion from the backpack; if none
-    are held, walk to a healer NPC (Brother Aldric) and take their heal option.
+def make_heal(force_healer=False):
+    """Heal to full. By default prefer drinking a health potion, falling back to
+    a healer NPC (Brother Aldric). With force_healer=True, skip potions and go
+    straight to the healer -- useful for testing the dialogue path.
 
     The backpack lives in the `equipment` message, not the snapshot, so this
     reads bot.equipment (populated by avalon_bot's run loop)."""
-    me = me_of(bot, snap)
-    if not me:
-        return
-    if me["hp"] >= me["maxHp"]:
-        print(f"already full ({me['hp']}/{me['maxHp']})")
-        bot.done = True
-        return
-
-    # 1) Drink potions while one would actually help. A potion only counts if
-    #    the missing HP is at least, say, half its heal value -- otherwise the
-    #    overheal is wasted, so we stop and let natural regen finish the last
-    #    sliver rather than spamming useItem (which the server just ignores).
-    now = _now()
-    missing = me["maxHp"] - me["hp"]
-    last_drink = getattr(bot, "_heal_last_drink", 0.0)
-    useful = [(bot.find_item(pid), amt) for pid, amt in HEAL_POTIONS
-              if bot.find_item(pid) and missing >= amt * 0.5]
-    if useful:
-        potion, amt = useful[0]
-        if now - last_drink < 0.8:      # server has a short potion cooldown
+    async def intent(bot, snap):
+        me = me_of(bot, snap)
+        if not me:
             return
-        print(f"hp {me['hp']}/{me['maxHp']} -- drinking {potion['itemId']} "
-              f"(+{amt}, x{bot.count_item(potion['itemId'])} held)")
-        await bot.use_item(potion["instanceId"])
-        bot._heal_last_drink = now
-        return
-    if last_drink:
-        # Drank at least one and now the rest would overheal (or we're out).
-        held = sum(bot.count_item(pid) for pid, _ in HEAL_POTIONS)
-        tail = "out of health potions" if not held else "close enough (regen will finish)"
-        print(f"hp {me['hp']}/{me['maxHp']} -- {tail}")
-        bot.done = True
-        return
+        if me["hp"] >= me["maxHp"]:
+            print(f"already full ({me['hp']}/{me['maxHp']})")
+            bot.done = True
+            return
 
-    # 2) No potion: head to a healer NPC and use their dialogue.
-    healer = next((n for n in snap["npcs"]
-                   if n.get("name", "").lower() in HEALER_NAMES
-                   or n.get("npcType", "").lower() in HEALER_NAMES), None)
-    if not healer:
-        print(f"hp {me['hp']}/{me['maxHp']} -- no health potion held and no "
-              "healer NPC nearby. Move to Brother Aldric, then run `heal` again.")
-        bot.done = True
-        return
+        # 1) Drink potions while one would actually help. A potion only counts if
+        #    the missing HP is at least half its heal value -- otherwise the
+        #    overheal is wasted, so we stop and let regen finish the last sliver
+        #    rather than spamming useItem (which the server just ignores).
+        if not force_healer:
+            now = _now()
+            missing = me["maxHp"] - me["hp"]
+            last_drink = getattr(bot, "_heal_last_drink", 0.0)
+            useful = [(bot.find_item(pid), amt) for pid, amt in HEAL_POTIONS
+                      if bot.find_item(pid) and missing >= amt * 0.5]
+            if useful:
+                potion, amt = useful[0]
+                if now - last_drink < 0.8:   # server has a short potion cooldown
+                    return
+                print(f"hp {me['hp']}/{me['maxHp']} -- drinking {potion['itemId']} "
+                      f"(+{amt}, x{bot.count_item(potion['itemId'])} held)")
+                await bot.use_item(potion["instanceId"])
+                bot._heal_last_drink = now
+                return
+            if last_drink:
+                held = sum(bot.count_item(pid) for pid, _ in HEAL_POTIONS)
+                tail = ("out of health potions" if not held
+                        else "close enough (regen will finish)")
+                print(f"hp {me['hp']}/{me['maxHp']} -- {tail}")
+                bot.done = True
+                return
 
-    if dist_px(me["x"], me["y"], healer["x"], healer["y"]) > TILE * 1.5:
-        # Walk to the healer first.
-        await bot.move(*step_toward(me, healer["x"], healer["y"]))
-        return
+        # 2) Head to a healer NPC and use their dialogue.
+        healer = next((n for n in snap["npcs"]
+                       if n.get("name", "").lower() in HEALER_NAMES
+                       or n.get("npcType", "").lower() in HEALER_NAMES), None)
+        if not healer:
+            print(f"hp {me['hp']}/{me['maxHp']} -- no healer NPC nearby. "
+                  "Move to Brother Aldric, then run `heal` again.")
+            bot.done = True
+            return
 
-    # In range: stop and open/advance the dialogue. The heal option id is
-    # dynamic, so we open the dialogue and let on_event pick the heal option.
-    await bot.move(0, 0)
-    if not getattr(bot, "_heal_talk_sent", False):
-        bot._heal_talk_sent = True
-        bot._heal_npc = healer["id"]
-        print(f"hp {me['hp']}/{me['maxHp']} -- talking to {healer.get('name')}")
-        await bot.talk_to(healer["id"])
+        if dist_px(me["x"], me["y"], healer["x"], healer["y"]) > TILE * 1.5:
+            # Walk to the healer first.
+            await bot.move(*step_toward(me, healer["x"], healer["y"]))
+            return
+
+        # In range: stop and open the dialogue. The heal option id is dynamic,
+        # so we open the dialogue and let on_event pick the heal option.
+        await bot.move(0, 0)
+        if not getattr(bot, "_heal_talk_sent", False):
+            bot._heal_talk_sent = True
+            bot._heal_npc = healer["id"]
+            print(f"hp {me['hp']}/{me['maxHp']} -- talking to {healer.get('name')}")
+            await bot.talk_to(healer["id"])
+    return intent
 
 
 async def heal_on_event(bot, msg):
@@ -349,9 +353,22 @@ def make_move(spec):
     return intent
 
 
-async def intent_farm(bot, snap):
-    # Reuse the flee-aware combat AI already in avalon_bot.
-    await ab.example_ai(bot, snap)
+def make_farm(until_hp_frac=None):
+    """Fight nearby monsters. If until_hp_frac is set, stop and exit cleanly
+    once HP falls to that fraction (a safe grind-to-X%, no death spiral)."""
+    async def intent(bot, snap):
+        me = me_of(bot, snap)
+        if me and until_hp_frac is not None:
+            frac = me["hp"] / max(1, me["maxHp"])
+            if frac <= until_hp_frac:
+                await bot.move(0, 0)
+                print(f"reached {me['hp']}/{me['maxHp']} "
+                      f"({frac*100:.0f}% <= {until_hp_frac*100:.0f}%) -- stopping")
+                bot.done = True
+                return
+        # Reuse the flee-aware combat AI already in avalon_bot.
+        await ab.example_ai(bot, snap)
+    return intent
 
 
 def make_send(raw):
@@ -372,11 +389,17 @@ async def run(bot, intent, on_event=None):
     bot.done = False
 
     async def wrapped(b, snap):
+        # Once done, the socket is closing -- don't run the intent again (it
+        # would try to send on a closed socket and raise ConnectionClosed).
+        if getattr(b, "done", False):
+            return
         await intent(b, snap)
         if getattr(b, "done", False):
             await b.ws.close()
 
     async def wrapped_event(b, msg):
+        if getattr(b, "done", False):
+            return
         if on_event:
             await on_event(b, msg)
         if getattr(b, "done", False):
@@ -399,9 +422,10 @@ def build_intent(args):
     if args.cmd == "respawn":
         return intent_respawn, None
     if args.cmd == "heal":
-        return intent_heal, heal_on_event
+        return make_heal(force_healer=args.healer), heal_on_event
     if args.cmd == "farm":
-        return intent_farm, None
+        frac = (args.until_hp / 100.0) if args.until_hp is not None else None
+        return make_farm(frac), None
     if args.cmd == "follow":
         return make_follow(args.target, args.keep * TILE), None
     if args.cmd == "move":
@@ -422,8 +446,14 @@ def main():
 
     sub.add_parser("where", help="print positions of everyone visible and exit")
     sub.add_parser("respawn", help="respawn if dead")
-    sub.add_parser("heal", help="use a healing item (needs configuration)")
-    sub.add_parser("farm", help="fight nearby monsters until Ctrl-C")
+
+    h = sub.add_parser("heal", help="drink a health potion, else visit a healer NPC")
+    h.add_argument("--healer", action="store_true",
+                   help="skip potions; go straight to Brother Aldric")
+
+    fa = sub.add_parser("farm", help="fight nearby monsters until Ctrl-C")
+    fa.add_argument("--until-hp", type=float, default=None, metavar="PCT",
+                    help="stop and exit once HP drops to this %% (e.g. 50)")
 
     f = sub.add_parser("follow", help="follow a player until Ctrl-C")
     f.add_argument("target")
