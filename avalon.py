@@ -105,6 +105,20 @@ def pick_character(chars, name):
 def me_of(bot, snap):
     return next((p for p in snap["players"] if p["id"] == bot.me), None)
 
+def _norm_name(s):
+    return s.lower().replace("_", " ").strip()
+
+def name_matches(query, name):
+    """Forgiving player-name match: case-insensitive, treats '_' like ' ', and
+    accepts a first-word or substring hit so 'sam', 'sam_altman', and
+    'Sam Altman' all resolve to the character displayed as 'sam altman'."""
+    q, n = _norm_name(query), _norm_name(name)
+    return n == q or (n and n.split()[0] == q) or (q and q in n)
+
+def find_player(snap, query, exclude_id=None):
+    return next((p for p in snap["players"]
+                 if p["id"] != exclude_id and name_matches(query, p["name"])), None)
+
 def step_toward(me, tx_px, ty_px):
     """Return (dx,dy) each in {-1,0,1} pointing from me toward a px target."""
     dx = (tx_px > me["x"]) - (tx_px < me["x"])
@@ -123,7 +137,7 @@ def resolve_target(spec, snap):
     if spec.lower() in LOCATIONS:
         tx, ty = LOCATIONS[spec.lower()]
         return (tx + 0.5) * TILE, (ty + 0.5) * TILE
-    p = next((p for p in snap["players"] if p["name"].lower() == spec.lower()), None)
+    p = find_player(snap, spec)
     if p:
         return p["x"], p["y"]
     return None
@@ -275,16 +289,27 @@ def make_follow(target_name, keep_px):
         me = me_of(bot, snap)
         if not me:
             return
-        t = next((p for p in snap["players"]
-                  if p["name"].lower() == target_name.lower()), None)
+        t = find_player(snap, target_name, exclude_id=bot.me)
 
         if t:
+            if not getattr(bot, "_follow_seen", False):
+                bot._follow_seen = True
+                print(f"following {t['name']!r} "
+                      f"(keep {keep_px/TILE:.0f} tiles behind)", file=sys.stderr)
             bot._follow_last = (t["x"], t["y"], _now())
             tx, ty = t["x"], t["y"]
         else:
             last = getattr(bot, "_follow_last", None)
             if not last or _now() - last[2] > LOST_GRACE_S:
-                # Never seen them, or lost too long ago -- hold position.
+                # Never seen them, or lost too long ago -- hold position and,
+                # the first time, say who *is* visible so a name typo/mismatch
+                # (the usual "it just stands there" cause) is obvious.
+                if not getattr(bot, "_follow_warned", False):
+                    bot._follow_warned = True
+                    visible = [p["name"] for p in snap["players"]
+                               if p["id"] != bot.me]
+                    print(f"target {target_name!r} not in view. Visible players: "
+                          f"{visible or '(none)'}", file=sys.stderr)
                 await bot.move(0, 0)
                 return
             tx, ty = last[0], last[1]
