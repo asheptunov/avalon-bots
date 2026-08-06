@@ -72,12 +72,13 @@ readiness model.
   roughly-equidistant ring around the leader. Symmetric spring (no lag when the
   leader retreats). Verified in a sim: 4 escorts settle ~ring radius from the
   leader, spread out. Composes with any intent.
-  - **Obstacle fix:** feed A* a goal projected a few tiles along the force and
-    quantized to a tile centre — NOT `me + force` (that goal was ~1 tile away
-    and jittered each tick, so A* couldn't route around a tree and the bot
-    pinned against the trunk). A stable, several-tiles-out goal lets the cached
-    A* path around obstacles. Sim-verified it clears a wall between it and the
-    ring, and still settles cleanly in open field.
+  - **Obstacle fix (FAR/NEAR split):** projecting the force into a goal could
+    aim it THROUGH a tree, landing the goal inside the wall; A* snapped that back
+    to the bot's own tile → "arrived" → frozen. Fix: when FAR from the ring, path
+    to the LEADER via A* (always reachable, routes around obstacles) and stop at
+    the ring; when NEAR, use the local force balance for fine spacing. Plus
+    player-collision (above) so they don't stack. Sim-verified: walks around a
+    tall wall, settles into an even ring, doesn't pile up.
 
 **KEY LIVE ASSUMPTION (validate next test):** all three intents rely on the
 server's `enraged` monster flag meaning "actively in a fight". Confirmed the
@@ -121,6 +122,13 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
   - Output: `avalon_maps.json` (7 zones, committed).
 - `avalon_nav.py` — loads the grid, `find_path` (8-connected A*, no corner-cut),
   `path_step` (cached path follower). Validated in-game tile-for-tile.
+- **Dynamic obstacles (player collision):** the server blocks players from
+  walking through each other, which the static map doesn't know — so bots stacked
+  single-file and pinned on each other. Fix: `find_path`/`path_step` take a
+  `blocked` set of occupied tiles; each bot stashes the other players' tiles on
+  itself each tick (`set_nav_obstacles` → `bot._occupied`) and A* routes around
+  them. Start tile is never blocked; a blocked goal snaps to the nearest free
+  tile. Sim-verified: 4 stacked escorts spread into a ring, no shared tiles.
 - **Key gotcha (fixed):** server labels tiles by `round(px/TILE)`, NOT
   `floor`. Flooring caused a half-tile mismatch that pinned bots at walls.
   `avalon_nav._tile` uses round.

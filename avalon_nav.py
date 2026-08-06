@@ -53,10 +53,16 @@ _NEIGHBORS = [(-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
               (-1, 1, 1.41421356), (1, 1, 1.41421356)]
 
 
-def _nearest_walkable(z, tx, ty, radius=6):
-    """If a tile is blocked (e.g. a monster's tile, or a target inside a wall),
-    snap to the closest walkable tile within `radius` so A* still has a goal."""
-    if walkable(z, tx, ty):
+def _free(z, tx, ty, blocked):
+    """Walkable per the static map AND not currently occupied by a dynamic
+    obstacle (another player). `blocked` is a set of (tx,ty) tiles."""
+    return walkable(z, tx, ty) and (tx, ty) not in blocked
+
+
+def _nearest_walkable(z, tx, ty, blocked=frozenset(), radius=6):
+    """If a tile is blocked (a wall, or a tile a player stands on), snap to the
+    closest free tile within `radius` so A* still has a reachable goal."""
+    if _free(z, tx, ty, blocked):
         return tx, ty
     best = None
     for r in range(1, radius + 1):
@@ -64,7 +70,7 @@ def _nearest_walkable(z, tx, ty, radius=6):
             for dy in range(-r, r + 1):
                 if max(abs(dx), abs(dy)) != r:
                     continue
-                if walkable(z, tx + dx, ty + dy):
+                if _free(z, tx + dx, ty + dy, blocked):
                     d = dx * dx + dy * dy
                     if best is None or d < best[0]:
                         best = (d, tx + dx, ty + dy)
@@ -73,14 +79,24 @@ def _nearest_walkable(z, tx, ty, radius=6):
     return None
 
 
-def find_path(z, start_tile, goal_tile, max_expand=20000):
+def find_path(z, start_tile, goal_tile, blocked=None, max_expand=20000):
     """A* on the 8-connected walkability grid. Returns a list of (tx,ty) tiles
     from just-after-start through goal, or [] if unreachable. Diagonals may not
-    cut through a wall corner (both orthogonal neighbours must be open)."""
+    cut through a wall corner (both orthogonal neighbours must be open).
+
+    `blocked` is an optional set of dynamically-occupied tiles (other players) to
+    route AROUND -- the server enforces player collision, which the static map
+    doesn't know about, so without this bots stack single-file and pin on each
+    other. The start tile is never treated as blocked (we're standing on it), and
+    a blocked goal is snapped to the nearest free tile so it stays reachable."""
     if not have_map(z):
         return []
     sx, sy = start_tile
-    goal = _nearest_walkable(z, *goal_tile)
+    blocked = blocked or frozenset()
+    # Never block where we already stand.
+    if (sx, sy) in blocked:
+        blocked = blocked - {(sx, sy)}
+    goal = _nearest_walkable(z, goal_tile[0], goal_tile[1], blocked)
     if goal is None:
         return []
     gx, gy = goal
@@ -109,10 +125,10 @@ def find_path(z, start_tile, goal_tile, max_expand=20000):
             return []
         for dx, dy, cost in _NEIGHBORS:
             nx, ny = x + dx, y + dy
-            if not walkable(z, nx, ny):
+            if not _free(z, nx, ny, blocked):
                 continue
             if dx and dy:                # no corner-cutting through walls
-                if not (walkable(z, x + dx, y) and walkable(z, x, y + dy)):
+                if not (_free(z, x + dx, y, blocked) and _free(z, x, y + dy, blocked)):
                     continue
             ng = g + cost
             if ng < gscore.get((nx, ny), 1e18):
@@ -130,16 +146,20 @@ def _tile(px):
     return int(round(px / TILE))
 
 
-def path_step(bot, me, z, goal_px, repath_tiles=3):
+def path_step(bot, me, z, goal_px, blocked=None, repath_tiles=3):
     """Return a (dx,dy) in {-1,0,1} that follows an A* path from the bot's tile
     to the goal, caching the path on `bot` and recomputing only when the goal
-    moves, we consume the path, or we drift off it. Falls back to a greedy step
-    toward the goal when there's no map for this z (so behaviour degrades safely
-    on unknown zones). This is the drop-in replacement for the old blind mover.
+    moves, we consume the path, we drift off it, or a dynamic obstacle lands on
+    our next step. Falls back to a greedy step toward the goal when there's no
+    map for this z (so behaviour degrades safely on unknown zones).
 
-    goal_px is (x_px, y_px). Diagonal steps are allowed (the client permits them)."""
+    `blocked` is an optional set of dynamically-occupied tiles (other players) to
+    route around -- the server blocks player-on-player movement, so without this
+    the pack stacks single-file and pins. goal_px is (x_px, y_px). Diagonal steps
+    are allowed (the client permits them)."""
     gx, gy = _tile(goal_px[0]), _tile(goal_px[1])
     sx, sy = _tile(me["x"]), _tile(me["y"])
+    blocked = blocked or frozenset()
 
     if not have_map(z):
         # No collision data -> greedy sign step (legacy behaviour).
@@ -159,9 +179,12 @@ def path_step(bot, me, z, goal_px, repath_tiles=3):
         nxt = cache["tiles"][0]
         if max(abs(sx - nxt[0]), abs(sy - nxt[1])) > repath_tiles:
             need = True
+        # A player stepped onto our planned next tile -> repath around them.
+        elif any(t in blocked for t in cache["tiles"][:2]):
+            need = True
 
     if need:
-        tiles = find_path(z, (sx, sy), (gx, gy))
+        tiles = find_path(z, (sx, sy), (gx, gy), blocked=blocked)
         cache = {"goal": (gx, gy), "tiles": tiles}
         bot._path = cache
 
@@ -193,20 +216,21 @@ def path_step(bot, me, z, goal_px, repath_tiles=3):
     eps = TILE * 0.2
     dx = (tcx - me["x"] > eps) - (tcx - me["x"] < -eps)
     dy = (tcy - me["y"] > eps) - (tcy - me["y"] < -eps)
-    return _safe_step(z, sx, sy, dx, dy)
+    return _safe_step(z, sx, sy, dx, dy, blocked)
 
 
-def _safe_step(z, sx, sy, dx, dy):
-    """Never command a move that walks straight into a wall. If the intended
-    neighbour is blocked (or a diagonal that clips a wall corner), fall back to
-    whichever single-axis component is walkable."""
+def _safe_step(z, sx, sy, dx, dy, blocked=frozenset()):
+    """Never command a move that walks straight into a wall OR onto a tile a
+    player occupies. If the intended neighbour is blocked (or a diagonal that
+    clips a wall corner), fall back to whichever single-axis component is free."""
     if dx == 0 and dy == 0:
         return 0, 0
-    if walkable(z, sx + dx, sy + dy) and not (
-            dx and dy and not (walkable(z, sx + dx, sy) and walkable(z, sx, sy + dy))):
+    if _free(z, sx + dx, sy + dy, blocked) and not (
+            dx and dy and not (_free(z, sx + dx, sy, blocked)
+                               and _free(z, sx, sy + dy, blocked))):
         return dx, dy
-    if dx and walkable(z, sx + dx, sy):
+    if dx and _free(z, sx + dx, sy, blocked):
         return dx, 0
-    if dy and walkable(z, sx, sy + dy):
+    if dy and _free(z, sx, sy + dy, blocked):
         return 0, dy
     return 0, 0

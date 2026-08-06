@@ -131,15 +131,36 @@ def step_toward(me, tx_px, ty_px):
     return dx, dy
 
 
+def occupied_tiles(snap, me):
+    """Tiles currently occupied by OTHER players -- the dynamic obstacles A* must
+    route around, because the server enforces player-vs-player collision that the
+    static map doesn't know about. Excludes `me` (we stand on our own tile). Each
+    bot computes this from its own snapshot; no coordination needed."""
+    mid = me["id"]
+    return frozenset((nav._tile(p["x"]), nav._tile(p["y"]))
+                     for p in snap["players"] if p["id"] != mid)
+
+
 def nav_step(bot, me, tx_px, ty_px):
     """Step toward a pixel target using real A* pathfinding over the extracted
-    collision grid (avalon_nav). Routes around walls/buildings and follows the
-    path tile-by-tile; on a z-level with no map it degrades to a greedy step.
+    collision grid (avalon_nav). Routes around walls/buildings AND other players
+    (dynamic obstacles), and follows the path tile-by-tile; on a z-level with no
+    map it degrades to a greedy step.
 
+    The set of player-occupied tiles is stashed on the bot each tick (see
+    set_nav_obstacles); reading it here keeps nav_step's many call sites simple.
     This replaced an earlier blind wall-slide heuristic once we extracted the
     client's collision map -- planning beats fumbling, so bots no longer orbit
-    corners or pin in doorways."""
-    return nav.path_step(bot, me, getattr(bot, "z", 0), (tx_px, ty_px))
+    corners, pin in doorways, or stack single-file on each other."""
+    blocked = getattr(bot, "_occupied", None)
+    return nav.path_step(bot, me, getattr(bot, "z", 0), (tx_px, ty_px),
+                         blocked=blocked)
+
+
+def set_nav_obstacles(bot, snap, me):
+    """Record the player-occupied tiles on the bot for this tick so nav_step can
+    route around them. Call once at the top of each intent that navigates."""
+    bot._occupied = occupied_tiles(snap, me)
 
 def dist_px(ax, ay, bx, by):
     return math.hypot(ax - bx, ay - by)
@@ -710,42 +731,46 @@ FORMATIONS = ("none", "magnetize")
 
 
 def magnetize_step(bot, me, leader, members, snap, cfg):
-    """Boids-style station-keeping as a force balance, so the pack settles into a
-    ring of roughly-even spacing around the leader. Three forces sum to a desired
-    velocity; we step along it whenever we're off the equilibrium (no dead
-    'comfort gap', which is what made escorts lag behind a retreating leader):
+    """Boids-style station-keeping: escorts settle into a ring of roughly-even
+    spacing around the leader. Split into a FAR and a NEAR regime so obstacles
+    never trap the bot:
 
-      * anchor spring -- pulls toward a target ring radius from the leader. The
-        force is SIGNED by (d_lead - ring): too far in -> pushed out, too far
-        out -> pulled in, zero exactly on the ring. Symmetric, so following a
-        retreating leader is as strong as backing off an approaching one.
-      * separation   -- pushes off any neighbour inside personal space, strongest
-        when overlapping. This is what spreads the ring out evenly.
-      * threat avoidance -- shoves away from a near aggro monster.
+      * FAR (outside the ring): path to the LEADER via A*. The leader is always a
+        reachable goal, so A* routes around trees/buildings to close the distance
+        -- no blind force-projection that can aim the goal into a wall (which
+        made a bot 'arrive' against a trunk and freeze). We just stop once we
+        reach the ring.
+      * NEAR (on/inside the ring): apply the local force balance -- a symmetric
+        ring spring (push out if too close) plus neighbour separation plus threat
+        avoidance -- to fine-tune position and spread the ring out evenly. Here
+        the goal is only a step away, which is fine: there's no wall to route
+        around at conversational range, and the even-spacing equilibrium emerges
+        from the separation term.
 
-    Equilibrium (net zero) is: sitting on the ring, evenly spaced from
-    neighbours. We don't compute that spacing -- it emerges from the balance.
-    Pure local rule over the snapshot; no coordination channel."""
+    Pure local rule over the snapshot; no coordination channel. Falls back to a
+    plain leader-follow if the leader isn't visible."""
     if not leader:
         return follow_leader_step(bot, me, leader, snap, cfg)
 
-    # Target ring radius: the comfort distance we want to hold from the leader.
     ring = max(TILE, cfg.follow_gap_px)
-    # Personal space between neighbours: ring-sized, so an evenly-spread ring is
-    # the joint equilibrium of anchor+separation.
-    personal = max(TILE, ring)
-
-    fx = fy = 0.0
-    # Anchor spring toward the ring. Unit vector leader->me, scaled by how far
-    # off-ring we are (signed): positive error (outside) pulls in, negative
-    # (inside) pushes out. Same gain both directions -> symmetric, no lag.
+    personal = max(TILE, ring)                      # neighbour personal space
     dlx, dly = me["x"] - leader["x"], me["y"] - leader["y"]
     d_lead = math.hypot(dlx, dly) or 1e-6
-    err = d_lead - ring                            # >0 too far, <0 too close
-    ux, uy = dlx / d_lead, dly / d_lead            # points from leader to me
-    fx += -ux * err                                # -err*u: outside -> inward
-    fy += -uy * err
 
+    # FAR: too far outside the ring -> let A* walk us to the leader (routes around
+    # obstacles). A little hysteresis (1.25*ring) so we don't flip regimes right
+    # at the boundary.
+    if d_lead > ring * 1.25:
+        return nav_step(bot, me, leader["x"], leader["y"])
+
+    # NEAR: local force balance for fine positioning + even spacing.
+    fx = fy = 0.0
+    # Symmetric ring spring: signed by (d_lead - ring). Outside -> inward,
+    # inside -> outward, zero on the ring.
+    err = d_lead - ring
+    ux, uy = dlx / d_lead, dly / d_lead             # leader -> me
+    fx += -ux * err
+    fy += -uy * err
     # Separation: push off neighbours inside personal space, weighted by overlap.
     for p in members.values():
         if p["id"] == me["id"] or p["id"] == leader["id"]:
@@ -753,10 +778,9 @@ def magnetize_step(bot, me, leader, members, snap, cfg):
         px, py = me["x"] - p["x"], me["y"] - p["y"]
         d = math.hypot(px, py)
         if 0 < d < personal:
-            w = (personal - d) / personal          # 0 at edge, 1 when overlapping
+            w = (personal - d) / personal
             fx += (px / d) * personal * w
             fy += (py / d) * personal * w
-
     # Threat avoidance: shove away from the nearest aggro monster in range.
     threats = [m for m in snap["monsters"]
                if m["hp"] > 0 and m["monsterType"] in AGGRO_MONSTERS
@@ -766,23 +790,15 @@ def magnetize_step(bot, me, leader, members, snap, cfg):
         fx += (me["x"] - thr["x"])
         fy += (me["y"] - thr["y"])
 
-    # Deadband ~a third of a tile: once the net force is tiny we're on station.
+    # Deadband: once the net force is tiny we're on station.
     mag = math.hypot(fx, fy)
     if mag < TILE * 0.33:
         return 0, 0
-
-    # Hand A* a goal that's FAR ENOUGH to route around obstacles. Aiming one
-    # force-step ahead (me + f) put the goal ~1 tile away and jittering each
-    # tick: A* can't plan around a tree that close, so the bot pins against the
-    # trunk (the force says "go left", the tree is left, greedy step nets zero).
-    # Instead we project the force direction out by a fixed lookahead (a few
-    # tiles) and QUANTIZE it to a tile centre, so the goal is stable tick-to-tick
-    # -- that lets path_step's cached A* actually build a path around the tree.
-    look = max(cfg.follow_gap_px, 3 * TILE)
-    gx = me["x"] + fx / mag * look
-    gy = me["y"] + fy / mag * look
-    gx = round(gx / TILE) * TILE                   # snap to tile centre (round-based)
-    gy = round(gy / TILE) * TILE
+    # Near range: aim a couple tiles along the force (stable, quantized) so A*
+    # still nudges around any small obstacle without pinning.
+    reach = min(mag, 2 * TILE)
+    gx = round((me["x"] + fx / mag * reach) / TILE) * TILE
+    gy = round((me["y"] + fy / mag * reach) / TILE) * TILE
     return nav_step(bot, me, gx, gy)
 
 
@@ -835,6 +851,7 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
         me = me_of(bot, snap)
         if not me:
             return
+        set_nav_obstacles(bot, snap, me)
 
         raw, members, leader = party_readiness(snap, cfg, leader_name)
         score = smooth_readiness(bot, raw, cfg)
@@ -903,6 +920,7 @@ def make_swarm_leader(cfg, focus_radius_px):
         me = me_of(bot, snap)
         if not me:
             return
+        set_nav_obstacles(bot, snap, me)
         # Anchor readiness on our own name so cohesion measures the escorts'
         # distance to us.
         raw, members, _ = party_readiness(snap, cfg, me["name"].lower())
@@ -966,6 +984,7 @@ def make_move(spec):
         me = me_of(bot, snap)
         if not me:
             return
+        set_nav_obstacles(bot, snap, me)
         dest = resolve_target(spec, snap)
         if dest is None:
             print(f"cannot resolve target {spec!r}")
