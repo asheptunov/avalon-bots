@@ -72,6 +72,12 @@ readiness model.
   roughly-equidistant ring around the leader. Symmetric spring (no lag when the
   leader retreats). Verified in a sim: 4 escorts settle ~ring radius from the
   leader, spread out. Composes with any intent.
+  - **Obstacle fix:** feed A* a goal projected a few tiles along the force and
+    quantized to a tile centre — NOT `me + force` (that goal was ~1 tile away
+    and jittered each tick, so A* couldn't route around a tree and the bot
+    pinned against the trunk). A stable, several-tiles-out goal lets the cached
+    A* path around obstacles. Sim-verified it clears a wall between it and the
+    ring, and still settles cleanly in open field.
 
 **KEY LIVE ASSUMPTION (validate next test):** all three intents rely on the
 server's `enraged` monster flag meaning "actively in a fight". Confirmed the

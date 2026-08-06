@@ -767,9 +767,23 @@ def magnetize_step(bot, me, leader, members, snap, cfg):
         fy += (me["y"] - thr["y"])
 
     # Deadband ~a third of a tile: once the net force is tiny we're on station.
-    if math.hypot(fx, fy) < TILE * 0.33:
+    mag = math.hypot(fx, fy)
+    if mag < TILE * 0.33:
         return 0, 0
-    return nav_step(bot, me, me["x"] + fx, me["y"] + fy)
+
+    # Hand A* a goal that's FAR ENOUGH to route around obstacles. Aiming one
+    # force-step ahead (me + f) put the goal ~1 tile away and jittering each
+    # tick: A* can't plan around a tree that close, so the bot pins against the
+    # trunk (the force says "go left", the tree is left, greedy step nets zero).
+    # Instead we project the force direction out by a fixed lookahead (a few
+    # tiles) and QUANTIZE it to a tile centre, so the goal is stable tick-to-tick
+    # -- that lets path_step's cached A* actually build a path around the tree.
+    look = max(cfg.follow_gap_px, 3 * TILE)
+    gx = me["x"] + fx / mag * look
+    gy = me["y"] + fy / mag * look
+    gx = round(gx / TILE) * TILE                   # snap to tile centre (round-based)
+    gy = round(gy / TILE) * TILE
+    return nav_step(bot, me, gx, gy)
 
 
 def swarm_target(intent_mode, snap, leader, anchor, members, focus_radius_px, cfg):
