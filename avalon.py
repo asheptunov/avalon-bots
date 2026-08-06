@@ -387,6 +387,56 @@ def nearest_huntable(snap, anchor, hunt_types):
     return min(prey, key=lambda m: dist_px(m["x"], m["y"], anchor["x"], anchor["y"]))
 
 
+# --- combat-state read (snapshot-only, no event plumbing) -------------------
+# The server marks a monster `enraged` while it's actively fighting -- it aggroed
+# a party member, or a passive mob (a rat) is retaliating against whoever hit it.
+# We don't get "who is it hitting", but an enraged monster is (by mechanics) on
+# top of its victim, so proximity to a party member tells us WHICH member it's
+# on. That's enough to distinguish "someone's in a fight" (join in) from "there's
+# an idle rat nearby" (leave it alone) -- with zero coordination channel.
+
+def monster_threatening_party(m, members, threat_px):
+    """True if monster `m` is actively fighting a party member: it's enraged AND
+    within threat_px of some member. (Enraged = it aggroed or is retaliating; the
+    range check pins it to a member it's actually on.)"""
+    if not (m["hp"] > 0 and m.get("enraged")):
+        return False
+    return any(dist_px(m["x"], m["y"], p["x"], p["y"]) <= threat_px
+               for p in members.values())
+
+
+def threats_to_party(snap, members, threat_px):
+    """Monsters actively fighting a party member, lowest-HP first. Deliberately
+    NOT filtered by hunt_types: defend is self-defense, so the pack swarms
+    whatever is attacking a member (an orc that aggroed us) even when we're only
+    out HUNTING rats. hunt_types governs what we seek out, not what we fend off."""
+    out = [m for m in snap["monsters"]
+           if monster_threatening_party(m, members, threat_px)]
+    return sorted(out, key=lambda m: m["hp"])       # focus lowest-HP first
+
+
+# How close an enraged monster must be to the leader to count as "the leader is
+# fighting THIS one". Melee-scale (not the party's wide threat radius) so an
+# escort's own fight a few tiles away doesn't read as the leader's -- that
+# distinction is what keeps the leader in control of the follow-pack.
+LEADER_ENGAGE_PX = ab.MELEE_RANGE_PX * 1.5
+
+
+def leader_engaged_with(target, leader, engage_px=LEADER_ENGAGE_PX):
+    """True if the LEADER is committed to fighting `target` -- that monster is
+    enraged and in melee reach of the leader. This is the `follow` trigger:
+    passive escorts pile onto exactly what the leader is fighting, and stop when
+    the leader stops, so the leader keeps control (peeling the party off a threat
+    just means the leader disengages). Keying off the leader specifically -- and
+    at melee scale, not the party's wide threat radius -- is what preserves that
+    control: otherwise an escort's own fight a few tiles off drags the pack in
+    and the leader can't call them off."""
+    if not target or not leader:
+        return False
+    return (target["hp"] > 0 and target.get("enraged")
+            and dist_px(target["x"], target["y"], leader["x"], leader["y"]) <= engage_px)
+
+
 # --------------------------------------------------------------------------
 # party readiness -- the shared "should we fight?" brain
 # --------------------------------------------------------------------------
@@ -641,76 +691,132 @@ def swarm_heartbeat(bot, role, members, score, cfg, target, me, period=2.0,
           f"hp={me['hp']}/{me['maxHp']} -> {state}", file=sys.stderr)
 
 
-# Escort intents -- the "hive" behaviours. Each shapes how an escort holds
-# station and whether it engages, layered on top of the SAME readiness gate:
-#   follow     -- trail the leader; focus-fire with the pack when ready (default).
-#   attack     -- aggressive: engage huntable monsters even when not clustered
-#                  (the gate is relaxed), so the hive presses the offensive.
-#   defend     -- protective: never chase; only fight monsters that come within
-#                  the leader's focus radius. Otherwise stay tight on the leader.
-#   magnetize  -- boids-like self-spacing: attraction to the pack centre plus
-#                  short-range repulsion from neighbours, so escorts spread out
-#                  evenly yet stay clustered around the leader (no messaging).
-INTENTS = ("follow", "attack", "defend", "magnetize")
+# Escort INTENT -- WHETHER/WHEN an escort engages (all share the readiness gate):
+#   follow  -- passive: only joins a fight the party has ALREADY started (a
+#              monster enraged on a member). Never initiates. The default.
+#   attack  -- aggressive: hunts huntable monsters near the anchor unprompted,
+#              even when the pack isn't clustered (cohesion-relaxed gate).
+#   defend  -- reactive: peels only to a monster attacking a party member; never
+#              touches idle mobs. Swarms an orc that aggros; helps a member a
+#              retaliating rat is hitting.
+INTENTS = ("follow", "attack", "defend")
+
+# Escort FORMATION -- HOW an escort holds station (orthogonal to intent):
+#   none       -- trail the leader (default column-follow).
+#   magnetize  -- boids-like self-spacing: attraction to the leader + short-range
+#                  repulsion from neighbours, so escorts spread out evenly yet
+#                  stay clustered. Composes with any intent.
+FORMATIONS = ("none", "magnetize")
 
 
 def magnetize_step(bot, me, leader, members, snap, cfg):
-    """Boids-style station-keeping: a (dx,dy) blending
-      * cohesion  -- pull toward the leader (the hive's anchor),
-      * separation-- push off any neighbour closer than a personal-space radius,
-      * avoidance -- push away from near aggro threats,
-    so the escorts distribute themselves evenly around the leader while staying
-    a cluster. Pure local rule over the snapshot -> emergent even spacing, no
-    coordination channel. Falls back to a plain follow if the leader's missing."""
+    """Boids-style station-keeping as a force balance, so the pack settles into a
+    ring of roughly-even spacing around the leader. Three forces sum to a desired
+    velocity; we step along it whenever we're off the equilibrium (no dead
+    'comfort gap', which is what made escorts lag behind a retreating leader):
+
+      * anchor spring -- pulls toward a target ring radius from the leader. The
+        force is SIGNED by (d_lead - ring): too far in -> pushed out, too far
+        out -> pulled in, zero exactly on the ring. Symmetric, so following a
+        retreating leader is as strong as backing off an approaching one.
+      * separation   -- pushes off any neighbour inside personal space, strongest
+        when overlapping. This is what spreads the ring out evenly.
+      * threat avoidance -- shoves away from a near aggro monster.
+
+    Equilibrium (net zero) is: sitting on the ring, evenly spaced from
+    neighbours. We don't compute that spacing -- it emerges from the balance.
+    Pure local rule over the snapshot; no coordination channel."""
     if not leader:
         return follow_leader_step(bot, me, leader, snap, cfg)
-    # Cohesion: vector toward the leader, but only pull once outside the comfort
-    # gap so the ring doesn't collapse onto the leader.
-    cx = cy = 0.0
-    d_lead = dist_px(me["x"], me["y"], leader["x"], leader["y"])
-    if d_lead > cfg.follow_gap_px:
-        cx += (leader["x"] - me["x"])
-        cy += (leader["y"] - me["y"])
-    # Separation: personal space ~= half the rally radius; push off neighbours
-    # (other party members) inside it, weighted by closeness.
-    personal = max(TILE, cfg.rally_px * 0.5)
+
+    # Target ring radius: the comfort distance we want to hold from the leader.
+    ring = max(TILE, cfg.follow_gap_px)
+    # Personal space between neighbours: ring-sized, so an evenly-spread ring is
+    # the joint equilibrium of anchor+separation.
+    personal = max(TILE, ring)
+
+    fx = fy = 0.0
+    # Anchor spring toward the ring. Unit vector leader->me, scaled by how far
+    # off-ring we are (signed): positive error (outside) pulls in, negative
+    # (inside) pushes out. Same gain both directions -> symmetric, no lag.
+    dlx, dly = me["x"] - leader["x"], me["y"] - leader["y"]
+    d_lead = math.hypot(dlx, dly) or 1e-6
+    err = d_lead - ring                            # >0 too far, <0 too close
+    ux, uy = dlx / d_lead, dly / d_lead            # points from leader to me
+    fx += -ux * err                                # -err*u: outside -> inward
+    fy += -uy * err
+
+    # Separation: push off neighbours inside personal space, weighted by overlap.
     for p in members.values():
-        if p["id"] == me["id"]:
+        if p["id"] == me["id"] or p["id"] == leader["id"]:
             continue
-        d = dist_px(me["x"], me["y"], p["x"], p["y"])
+        px, py = me["x"] - p["x"], me["y"] - p["y"]
+        d = math.hypot(px, py)
         if 0 < d < personal:
             w = (personal - d) / personal          # 0 at edge, 1 when overlapping
-            cx += (me["x"] - p["x"]) / d * personal * w
-            cy += (me["y"] - p["y"]) / d * personal * w
-    # Avoidance: shove away from the nearest aggro threat in range.
+            fx += (px / d) * personal * w
+            fy += (py / d) * personal * w
+
+    # Threat avoidance: shove away from the nearest aggro monster in range.
     threats = [m for m in snap["monsters"]
                if m["hp"] > 0 and m["monsterType"] in AGGRO_MONSTERS
                and dist_px(m["x"], m["y"], me["x"], me["y"]) <= cfg.threat_px]
     if threats:
         thr = min(threats, key=lambda m: dist_px(m["x"], m["y"], me["x"], me["y"]))
-        cx += (me["x"] - thr["x"])
-        cy += (me["y"] - thr["y"])
-    if abs(cx) < 1.0 and abs(cy) < 1.0:
-        return 0, 0                                # already well-placed -- hold
-    return nav_step(bot, me, me["x"] + cx, me["y"] + cy)
+        fx += (me["x"] - thr["x"])
+        fy += (me["y"] - thr["y"])
+
+    # Deadband ~a third of a tile: once the net force is tiny we're on station.
+    if math.hypot(fx, fy) < TILE * 0.33:
+        return 0, 0
+    return nav_step(bot, me, me["x"] + fx, me["y"] + fy)
 
 
-def make_swarm(leader_name, cfg, focus_radius_px, is_leader, intent_mode="follow"):
+def swarm_target(intent_mode, snap, leader, anchor, members, focus_radius_px, cfg):
+    """What THIS escort should fight this tick, given its intent. Returns a
+    monster dict or None -- None means 'don't engage, hold formation'.
+
+      attack  -- hunt: the focus monster near the anchor (aggressive, unprompted).
+      follow  -- passive: the focus monster ONLY if the LEADER is fighting it, so
+                 the leader keeps control (escorts join the leader's fight and
+                 quit when the leader does; the leader can peel them off a threat
+                 just by disengaging). Never triggers off a mere party member.
+      defend  -- reactive: the monster currently attacking ANY party member
+                 (nearest-victim threat), never an idle mob. Never hunts."""
+    if intent_mode == "attack":
+        return pick_focus_monster(snap, anchor, focus_radius_px, cfg.hunt_types)
+    if intent_mode == "follow":
+        # Fight exactly what the LEADER is fighting: the enraged monster on the
+        # leader (not a nearby focus pick, which could be a different mob). Lowest
+        # HP first so multiple followers converge on the same one -> focus fire.
+        # NOT filtered by hunt_types -- if the leader picked this fight (even an
+        # orc), the pack backs the leader up regardless of the hunt filter.
+        on_leader = [m for m in snap["monsters"] if leader_engaged_with(m, leader)]
+        return min(on_leader, key=lambda m: m["hp"]) if on_leader else None
+    if intent_mode == "defend":
+        threatened = threats_to_party(snap, members, cfg.threat_px)
+        return threatened[0] if threatened else None
+    # unknown -> behave like attack
+    return pick_focus_monster(snap, anchor, focus_radius_px, cfg.hunt_types)
+
+
+def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
+               intent_mode="follow", formation="none"):
     """One brain for both roles. Every tick:
 
       1. Compute party readiness (the shared P(win) score) from our snapshot.
-      2. If ready AND there's a target -> everyone focus-fires the same monster.
-      3. If NOT ready -> hold station per `intent_mode` (follow/defend/magnetize)
-         while dodging aggro threats. The leader waits up here too, so the pack
+      2. Decide a target from the INTENT (attack hunts, follow only joins a fight
+         the party started, defend only peels to a threatened member).
+      3. If there's a target AND the readiness gate is open -> focus-fire it.
+      4. Otherwise hold station in the chosen FORMATION (magnetize self-spaces;
+         otherwise trail the leader). The leader waits up here too, so the pack
          never desyncs into a cross-map stroll.
 
-    `intent_mode` (one of INTENTS) shapes engagement + station-keeping; see the
-    INTENTS docstring. It only tweaks the gate and the non-combat step -- every
-    mode still shares the readiness model, so the hive stays coherent.
+    `intent_mode` shapes engagement; `formation` is ORTHOGONAL and shapes
+    station-keeping -- any intent composes with any formation. Both still share
+    the readiness model, so the hive stays coherent.
 
-    is_leader only changes idle/fallback wandering, not the combat gate -- the
-    leader obeys the same readiness rule as the escorts, which is what makes the
-    'wait up before fighting' behavior fall out for free."""
+    is_leader only changes idle/fallback wandering, not the combat gate."""
     async def intent(bot, snap):
         me = me_of(bot, snap)
         if not me:
@@ -723,25 +829,29 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader, intent_mode="follow
         if not getattr(bot, "_swarm_greeted", False):
             bot._swarm_greeted = True
             role = "leading" if is_leader else f"escorting {leader_name!r}"
-            print(f"{role} [{intent_mode}]; party={sorted(members)} "
+            form = f"/{formation}" if formation != "none" else ""
+            print(f"{role} [{intent_mode}{form}]; party={sorted(members)} "
                   f"readiness={score:.2f}", file=sys.stderr)
 
         anchor = leader or me
-        target = pick_focus_monster(snap, anchor, focus_radius_px, cfg.hunt_types)
-        # `attack` intent presses the offensive: it doesn't wait for a tight pack,
-        # so it gates on readiness EXCLUDING cohesion (health/threat still apply,
-        # so it won't charge in with a dying member or into un-assembled aggro).
-        # `defend`/`follow`/`magnetize` gate on the full readiness as usual.
+        target = swarm_target(intent_mode, snap, leader, anchor, members,
+                              focus_radius_px, cfg)
+        # `attack` presses the offensive: it doesn't wait for a tight pack, so it
+        # gates on readiness EXCLUDING cohesion (health/threat still apply, so it
+        # won't charge in with a dying member or into un-assembled aggro).
+        # follow/defend gate on the full readiness (they only fight reactively
+        # anyway, so cohesion gating them is harmless and keeps the pack tight).
         if intent_mode == "attack":
             gate_raw = readiness_without_cohesion(snap, cfg, leader_name)
             gate_score = smooth_readiness(bot, gate_raw, cfg, slot="_gate_ema")
         else:
             gate_score = score
         go = combat_go(bot, gate_score, cfg)
-        swarm_heartbeat(bot, f"escort {me['name']} [{intent_mode}]", members,
+        label = f"{intent_mode}/{formation}" if formation != "none" else intent_mode
+        swarm_heartbeat(bot, f"escort {me['name']} [{label}]", members,
                         score, cfg, target, me, fighting=go)
 
-        # Gate: only fight when the squad is ready enough to win.
+        # Engage only when the intent picked a target AND the gate is open.
         if target and go:
             if dist_px(me["x"], me["y"], target["x"], target["y"]) < ab.MELEE_RANGE_PX:
                 await bot.move(0, 0)
@@ -750,11 +860,11 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader, intent_mode="follow
                 await bot.move(*nav_step(bot, me, target["x"], target["y"]))
             return
 
-        # Not fighting: hold station per intent. magnetize self-spaces around the
-        # leader; the rest trail the leader directly (so the column tracks a
+        # Not fighting: hold station per FORMATION. magnetize self-spaces around
+        # the leader; otherwise trail the leader directly (so the column tracks a
         # moving leader). Falls back to centroid regroup if the leader isn't
         # visible this snapshot.
-        if leader and intent_mode == "magnetize":
+        if leader and formation == "magnetize":
             await bot.move(*magnetize_step(bot, me, leader, members, snap, cfg))
         elif leader:
             await bot.move(*follow_leader_step(bot, me, leader, snap, cfg))
@@ -966,7 +1076,8 @@ def build_intent(args):
             return make_swarm_leader(cfg, args.focus_radius * TILE), None
         return make_swarm(leader_name, cfg, args.focus_radius * TILE,
                           is_leader=False,
-                          intent_mode=getattr(args, "intent", "follow")), None
+                          intent_mode=getattr(args, "intent", "follow"),
+                          formation=getattr(args, "formation", "none")), None
     if args.cmd == "move":
         return make_move(args.target), None
     if args.cmd == "send":
@@ -1005,19 +1116,27 @@ def run_swarm(args, accounts):
 
     escorts = [e.strip() for e in args.escort.split(",") if e.strip()]
     if not escorts:
-        sys.exit("swarm: give at least one --escort <account>[:intent]")
+        sys.exit("swarm: give at least one --escort <account>[:intent[:formation]]")
 
     # Escort membership names (for cohesion) = the escorts' display names plus
     # the leader's. Resolve each escort account to its character name so members/
-    # readiness line up with what's actually in-world.
-    esc_specs = []          # (account, intent, display_name)
+    # readiness line up with what's actually in-world. A spec is
+    # account[:intent[:formation]] -- omitted parts fall back to the --intent /
+    # --formation defaults.
+    esc_specs = []          # (account, intent, formation, display_name)
     for spec in escorts:
-        acct, _, intent = spec.partition(":")
-        intent = intent or args.intent
+        parts = spec.split(":")
+        acct = parts[0].strip()
+        intent = (parts[1].strip() if len(parts) > 1 and parts[1].strip()
+                  else args.intent)
+        formation = (parts[2].strip() if len(parts) > 2 and parts[2].strip()
+                     else args.formation)
         if intent not in INTENTS:
             sys.exit(f"swarm: unknown intent {intent!r}; choose from {INTENTS}")
-        disp = _resolve_display_name(accounts, acct.strip())
-        esc_specs.append((acct.strip(), intent, disp))
+        if formation not in FORMATIONS:
+            sys.exit(f"swarm: unknown formation {formation!r}; choose from {FORMATIONS}")
+        disp = _resolve_display_name(accounts, acct)
+        esc_specs.append((acct, intent, formation, disp))
 
     if args.leader and args.follow:
         sys.exit("swarm: pass either --leader (bot leader) or --follow "
@@ -1031,7 +1150,7 @@ def run_swarm(args, accounts):
     else:
         leader_name = args.follow
 
-    member_names = [d for _, _, d in esc_specs] + [leader_name]
+    member_names = [d for *_, d in esc_specs] + [leader_name]
     members_arg = ",".join(member_names)
 
     # Shared swarm tuning passed to every child.
@@ -1060,10 +1179,11 @@ def run_swarm(args, accounts):
     if args.leader:
         jobs.append((f"lead:{args.leader}",
                      child_cmd(args.leader, ["lead", *common])))
-    for acct, intent, _ in esc_specs:
-        jobs.append((f"escort:{acct}[{intent}]",
-                     child_cmd(acct, ["escort", leader_name,
-                                      "--intent", intent, *common])))
+    for acct, intent, formation, _ in esc_specs:
+        tag = f"{intent}/{formation}" if formation != "none" else intent
+        jobs.append((f"escort:{acct}[{tag}]",
+                     child_cmd(acct, ["escort", leader_name, "--intent", intent,
+                                      "--formation", formation, *common])))
 
     mode = f"bot-leader {leader_name!r}" if args.leader else f"human-leader {leader_name!r}"
     print(f"swarm: {mode}; {len(jobs)} process(es):", file=sys.stderr)
@@ -1166,10 +1286,12 @@ def main():
                        help="follow a leader and focus-fire once the party is tight")
     e.add_argument("leader", help="name of the player to escort")
     e.add_argument("--intent", choices=INTENTS, default="follow",
-                   help="hive behaviour: follow (trail+fight when ready), "
-                        "attack (press the offensive), defend (never chase, guard "
-                        "the leader), magnetize (self-space around the leader). "
-                        "Default follow.")
+                   help="engagement: follow (only join the LEADER's fight; "
+                        "default), attack (hunt unprompted), defend (peel to a "
+                        "monster attacking any member; never hunt).")
+    e.add_argument("--formation", choices=FORMATIONS, default="none",
+                   help="station-keeping (orthogonal to intent): none (trail the "
+                        "leader; default) or magnetize (boids self-spacing).")
     add_swarm_args(e)
 
     sw = sub.add_parser("swarm",
@@ -1180,12 +1302,17 @@ def main():
     sw.add_argument("--follow", metavar="NAME",
                     help="human-leader mode: your in-world character name; spawns "
                          "ONLY escorts, all following you (no bot leader)")
-    sw.add_argument("--escort", default="", metavar="A[:INTENT],B[:INTENT]...",
+    sw.add_argument("--escort", default="",
+                    metavar="A[:INTENT[:FORMATION]],...",
                     help="comma-separated escort accounts, each optionally with a "
-                         ":intent suffix (follow/attack/defend/magnetize), e.g. "
-                         "'haiku:magnetize,sonnet:defend,opus,fable'")
+                         ":intent and :formation suffix, e.g. "
+                         "'haiku:defend:magnetize,sonnet:attack,opus,fable'. "
+                         "Omitted parts use --intent / --formation.")
     sw.add_argument("--intent", choices=INTENTS, default="follow",
-                    help="default intent for escorts without a :suffix (default follow)")
+                    help="default intent for escorts without a :intent (default follow)")
+    sw.add_argument("--formation", choices=FORMATIONS, default="none",
+                    help="default formation for escorts without a :formation "
+                         "(default none)")
     sw.add_argument("--dry-run", action="store_true",
                     help="print the child commands instead of spawning them")
     add_swarm_args(sw)

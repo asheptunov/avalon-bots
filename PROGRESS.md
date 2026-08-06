@@ -39,30 +39,52 @@ python avalon.py swarm --follow "Sam Altman" --escort haiku,sonnet,opus,fable --
 Per-escort intents via a `:suffix` (or a default `--intent`):
 ```
 python avalon.py swarm --follow "Sam Altman" \
-  --escort "haiku:magnetize,sonnet:defend,opus:attack,fable:follow"
+  --escort "haiku:defend:magnetize,sonnet:attack,opus,fable" --formation magnetize
 ```
-`--dry-run` prints the child commands (and resolves account→character names)
-without spawning. Old per-shell `lead`/`escort` commands still work.
+Escort spec is `account[:intent[:formation]]`; omitted parts use `--intent` /
+`--formation`. `--dry-run` prints the child commands (and resolves
+account→character names) without spawning. Old per-shell `lead`/`escort`
+commands still work.
 
-### Escort intents (the hive)
-Each escort runs the SAME readiness model but shapes engagement + station-keeping:
-- **follow** (default) — trail the leader; focus-fire with the pack when ready.
-- **attack** — press the offensive: engages passive prey (rats) even when the
-  pack isn't clustered. Gates on readiness *excluding cohesion*, so it still
-  respects the health floor (won't charge with a dying member) and won't rush
-  un-assembled into auto-aggro monsters (factor_threat folds cohesion back in
-  when aggro is near).
-- **defend** — never chases; only fights monsters that enter the leader's focus
-  radius. Otherwise stays tight on the leader.
-- **magnetize** — boids-like: pull toward the leader + short-range repulsion
-  from neighbours (+ threat avoidance), so escorts self-space evenly yet stay
-  clustered. No coordination channel — emergent from the local rule.
+### Intent (WHEN to engage) — orthogonal to Formation (HOW to hold station)
+Intent and formation are **independent flags** that compose. All share the
+readiness model.
 
-**What determines if the party attacks:** every bot independently picks
-`pick_focus_monster` (nearest-to-leader huntable in focus range) and attacks it
-*if* its readiness gate is open. There's no comms, so followers don't read the
-leader's literal target — they converge on the *same* pick by running the same
-selector on near-identical snapshots. Implicit focus-fire, not command-following.
+**Intent** (`--intent`, or `:intent` per escort):
+- **follow** (default) — *passive*. Fights ONLY what the **leader** is fighting
+  (a monster enraged within melee reach of the leader). Never initiates; stops
+  when the leader stops. Keyed on the **leader specifically** (not "any member")
+  so the leader keeps control — to peel the pack off a threat, just disengage.
+  Not filtered by `--hunt`: backs the leader even against an orc.
+- **attack** — *aggressive*. Hunts huntable prey near the anchor unprompted,
+  even when the pack isn't clustered (gates on readiness *excluding cohesion*,
+  so it still respects the health floor and won't rush un-assembled into
+  auto-aggro). Respects `--hunt` (only seeks what you told it to).
+- **defend** — *reactive*. Peels only to a monster attacking **any** party member
+  (enraged + within threat range of a member). Never hunts idle mobs. NOT
+  filtered by `--hunt` — self-defense swarms whatever aggroed us (e.g. an orc)
+  even while out ratting.
+
+**Formation** (`--formation`, or `:intent:formation` per escort):
+- **none** (default) — trail the leader (column-follow).
+- **magnetize** — boids force-balance: anchor spring to a target ring radius +
+  short-range neighbour repulsion + threat avoidance. Settles into a
+  roughly-equidistant ring around the leader. Symmetric spring (no lag when the
+  leader retreats). Verified in a sim: 4 escorts settle ~ring radius from the
+  leader, spread out. Composes with any intent.
+
+**KEY LIVE ASSUMPTION (validate next test):** all three intents rely on the
+server's `enraged` monster flag meaning "actively in a fight". Confirmed the
+field is decoded (`avalon_bot.decode_snapshot`), but NOT yet confirmed in-game
+that a rat you (or an attack-escort) hit actually flips `enraged=True`, nor that
+an aggroing orc does. If `enraged` doesn't behave as assumed, follow/defend
+won't trigger and we need the combat-event stream (`attackerId`/`targetId`,
+already decoded but not routed to `on_event`) instead.
+
+**What determines if the party attacks:** no comms. Each escort picks its target
+from its intent (follow→leader's fight, attack→focus pick, defend→threatened
+member) over its own snapshot, and fires if its readiness gate is open. Multiple
+escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
 
 ---
 
@@ -124,13 +146,16 @@ selector on near-identical snapshots. Implicit focus-fire, not command-following
 
 Next up:
 
-- **Live smoke-test the human-leader hive** — run `swarm --follow "<my char>"`
-  with the four escorts (mixed intents) and confirm: they follow the *human*
-  leader, magnetize self-spaces, defend guards, attack presses. Not yet run.
+- **Live-validate the `enraged` assumption** (see KEY LIVE ASSUMPTION above) —
+  the single most load-bearing unknown. Everything follow/defend depends on it.
+- **Live smoke-test the reworked hive** — `swarm --follow "<my char>"` with mixed
+  intents/formations. Confirm: **follow** stays idle until YOU attack something,
+  then piles on, and STOPS when you disengage (leader keeps control); **defend**
+  ignores idle rats but swarms a mob attacking a member; **attack** hunts on its
+  own; **magnetize** self-spaces into an even ring with no lag when you retreat.
 - **Verify EMA/hysteresis defaults feel right live** — defaults are
-  `--readiness-smooth 0.4`, `--combat-exit = threshold-0.15`. The good farming
-  run didn't actually show gate-flipping (cohesion sat ~0.93), so this is
-  insurance for marginal packs; confirm it doesn't make engagement feel sluggish.
+  `--readiness-smooth 0.4`, `--combat-exit = threshold-0.15`. Insurance for
+  marginal packs; confirm it doesn't make engagement feel sluggish.
 
 Deferred / nice-to-have:
 
@@ -154,4 +179,9 @@ Deferred / nice-to-have:
 - [x] Removed vestigial waypoint routing (`--route` and all `route_*` helpers).
 - [x] One-command `swarm` launcher: bot-leader (`--leader`) or human-leader
   (`--follow`) mode, spawns child processes, tears down on Ctrl-C.
-- [x] Escort intents: follow / attack / defend / magnetize (the hive).
+- [x] Escort intents: follow / attack / defend (the hive), reworked so follow is
+  passive (leader-controlled), defend is threat-reactive (not a hunter), attack
+  presses. All keyed on the server `enraged` flag. Unit-tested.
+- [x] Split formation (magnetize) out of intent into an orthogonal `--formation`
+  flag; rebalanced the boids forces into a symmetric ring spring (no retreat
+  lag). Equilibrium verified in a sim.
