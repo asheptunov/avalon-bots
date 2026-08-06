@@ -131,33 +131,6 @@ def step_toward(me, tx_px, ty_px):
     return dx, dy
 
 
-# Within this of a waypoint counts as "arrived" -> advance to the next leg.
-WAYPOINT_REACHED_PX = TILE * 1.5
-
-
-def route_advance(bot, me, route):
-    """Advance bot._route_i past any waypoint we've reached; return the current
-    (target) index. Shared by leader and escorts so both thread the SAME
-    known-walkable path (the client has no collision map, so a shared road is how
-    the pack crosses walls without chasing each other's live position into a
-    corner)."""
-    i = getattr(bot, "_route_i", 0)
-    while i < len(route) and dist_px(me["x"], me["y"], *route[i]) < WAYPOINT_REACHED_PX:
-        i += 1
-    bot._route_i = i
-    return i
-
-
-def nearest_route_index(pt, route):
-    """Index of the route waypoint closest to a point (x_px, y_px). Lets an
-    escort cap its own progress at the leader's spot on the road, so it trails
-    rather than overtakes -- no messaging needed, just the leader's position."""
-    if not route:
-        return 0
-    return min(range(len(route)),
-               key=lambda i: dist_px(pt[0], pt[1], *route[i]))
-
-
 def nav_step(bot, me, tx_px, ty_px):
     """Step toward a pixel target using real A* pathfinding over the extracted
     collision grid (avalon_nav). Routes around walls/buildings and follows the
@@ -170,17 +143,6 @@ def nav_step(bot, me, tx_px, ty_px):
 
 def dist_px(ax, ay, bx, by):
     return math.hypot(ax - bx, ay - by)
-
-def parse_route(spec):
-    """';'-separated 'x,y' tile waypoints -> [(x_px, y_px), ...]. Empty -> []."""
-    route = []
-    for leg in spec.split(";"):
-        leg = leg.strip()
-        if not leg:
-            continue
-        xs, ys = leg.split(",", 1)
-        route.append(((float(xs) + 0.5) * TILE, (float(ys) + 0.5) * TILE))
-    return route
 
 def resolve_target(spec, snap):
     """A target spec -> (x_px, y_px). Accepts 'x,y' tiles, a location name,
@@ -451,12 +413,23 @@ class PartyConfig:
     def __init__(self, member_names, rally_px, threat_px,
                  combat_threshold=0.6, low_hp_frac=0.35, hunt_types=None,
                  cohesion_slack=2.5, hunt_enter=0.5, hunt_exit=0.3,
-                 follow_gap_px=None):
+                 follow_gap_px=None, readiness_smooth=1.0, combat_exit=None):
         self.member_names = member_names        # names that make up the party
         self.rally_px = rally_px                # "tight" = within this of leader
         self.threat_px = threat_px              # aggro monsters this close matter
         self.combat_threshold = combat_threshold
         self.low_hp_frac = low_hp_frac
+        # Readiness EMA: each tick the reported readiness is
+        #   smooth = alpha*raw + (1-alpha)*prev_smooth
+        # alpha=1.0 disables it (report the raw instantaneous value, the old
+        # behaviour). Smaller alpha = stickier, so a one-tick straggle or a
+        # transient threat can't instantly slam the combat gate shut/open.
+        self.readiness_smooth = readiness_smooth
+        # Combat-gate hysteresis: START fighting at combat_threshold, keep
+        # fighting until smoothed readiness sags below combat_exit (< threshold).
+        # The band between the two stops the gate chattering at the boundary.
+        # Defaults to combat_threshold (no hysteresis) unless set lower.
+        self.combat_exit = combat_exit if combat_exit is not None else combat_threshold
         self.hunt_types = hunt_types            # monster types to hunt (None=any)
         # Cohesion falloff: a member scores 0 only past rally_px*cohesion_slack.
         # Larger = a loose-but-nearby clump still reads as "tight enough".
@@ -541,6 +514,60 @@ def party_readiness(snap, cfg, leader_name):
     return score, members, leader
 
 
+def readiness_without_cohesion(snap, cfg, leader_name):
+    """Readiness with the cohesion factor removed -- the product of the remaining
+    factors (health, threat, ...). Used by the `attack` intent, which is willing
+    to engage without a tight pack but must still respect the safety factors (a
+    dying member, un-assembled aggro). Stays correct if new factors are appended
+    to READINESS_FACTORS -- only factor_cohesion is skipped.
+
+    Note: factor_threat still folds cohesion back in WHEN aggro is near, so attack
+    mode ignores clustering only for passive prey (rats); against auto-aggro
+    monsters it still won't charge in unassembled. That's the intended safety."""
+    members = party_members(snap, cfg, leader_name)
+    leader = members.get(leader_name) or find_player(snap, leader_name)
+    score = 1.0
+    for f in READINESS_FACTORS:
+        if f is factor_cohesion:
+            continue
+        score *= f(members, leader, snap, cfg)
+    return score
+
+
+def smooth_readiness(bot, raw, cfg, slot="_ready_ema"):
+    """Exponential moving average of readiness, kept per-bot. With alpha=1.0 it's
+    a passthrough (raw value). Otherwise it blends in the previous smoothed score
+    so momentary dips/spikes don't jerk the combat gate. Bot-local state means no
+    coordination needed -- each process smooths its own view, and since they all
+    see nearly the same snapshot their smoothed scores track together.
+
+    `slot` names the per-bot EMA state, so a caller that smooths two different
+    series (e.g. full readiness for the log AND a cohesion-excluded gate score)
+    keeps them in independent lanes rather than cross-contaminating one EMA."""
+    a = cfg.readiness_smooth
+    if a >= 1.0:
+        return raw
+    prev = getattr(bot, slot, None)
+    ema = raw if prev is None else a * raw + (1.0 - a) * prev
+    setattr(bot, slot, ema)
+    return ema
+
+
+def combat_go(bot, score, cfg):
+    """Hysteretic combat gate: return True while the squad should be fighting.
+    Enter combat when score >= combat_threshold; stay in combat until score drops
+    below combat_exit (<= threshold). The bot latches its fight/hold state so the
+    decision doesn't flip every tick at the boundary. `score` should be the
+    SMOOTHED readiness."""
+    fighting = getattr(bot, "_combat_on", False)
+    if fighting:
+        fighting = score >= cfg.combat_exit
+    else:
+        fighting = score >= cfg.combat_threshold
+    bot._combat_on = fighting
+    return fighting
+
+
 def party_centroid(members, exclude_id=None):
     pts = [(p["x"], p["y"]) for p in members.values() if p["id"] != exclude_id]
     if not pts:
@@ -590,12 +617,17 @@ def follow_leader_step(bot, me, leader, snap, cfg):
 
 
 def swarm_heartbeat(bot, role, members, score, cfg, target, me, period=2.0,
-                    note=None):
+                    note=None, fighting=None):
     """Throttled live readout so a running swarm is legible in its log: prints
     at most every `period` seconds, and immediately whenever the state changes.
     `note` lets a caller name the current purpose (e.g. 'hunting rat @(78,49)'
-    vs 'regrouping') so the log shows intent over time, not just fight/wait."""
-    fighting = bool(target and score >= cfg.combat_threshold)
+    vs 'regrouping') so the log shows intent over time, not just fight/wait.
+    `fighting` lets the caller pass the real (hysteretic) gate decision instead
+    of re-deriving it from a bare threshold compare."""
+    if fighting is None:
+        fighting = bool(target and score >= cfg.combat_threshold)
+    else:
+        fighting = bool(target and fighting)
     state = ("FIGHTING " + target["monsterType"]) if fighting else (
         note or ("waiting (not ready)" if target else "no target -- rallying"))
     now = _now()
@@ -609,14 +641,72 @@ def swarm_heartbeat(bot, role, members, score, cfg, target, me, period=2.0,
           f"hp={me['hp']}/{me['maxHp']} -> {state}", file=sys.stderr)
 
 
-def make_swarm(leader_name, cfg, focus_radius_px, is_leader):
+# Escort intents -- the "hive" behaviours. Each shapes how an escort holds
+# station and whether it engages, layered on top of the SAME readiness gate:
+#   follow     -- trail the leader; focus-fire with the pack when ready (default).
+#   attack     -- aggressive: engage huntable monsters even when not clustered
+#                  (the gate is relaxed), so the hive presses the offensive.
+#   defend     -- protective: never chase; only fight monsters that come within
+#                  the leader's focus radius. Otherwise stay tight on the leader.
+#   magnetize  -- boids-like self-spacing: attraction to the pack centre plus
+#                  short-range repulsion from neighbours, so escorts spread out
+#                  evenly yet stay clustered around the leader (no messaging).
+INTENTS = ("follow", "attack", "defend", "magnetize")
+
+
+def magnetize_step(bot, me, leader, members, snap, cfg):
+    """Boids-style station-keeping: a (dx,dy) blending
+      * cohesion  -- pull toward the leader (the hive's anchor),
+      * separation-- push off any neighbour closer than a personal-space radius,
+      * avoidance -- push away from near aggro threats,
+    so the escorts distribute themselves evenly around the leader while staying
+    a cluster. Pure local rule over the snapshot -> emergent even spacing, no
+    coordination channel. Falls back to a plain follow if the leader's missing."""
+    if not leader:
+        return follow_leader_step(bot, me, leader, snap, cfg)
+    # Cohesion: vector toward the leader, but only pull once outside the comfort
+    # gap so the ring doesn't collapse onto the leader.
+    cx = cy = 0.0
+    d_lead = dist_px(me["x"], me["y"], leader["x"], leader["y"])
+    if d_lead > cfg.follow_gap_px:
+        cx += (leader["x"] - me["x"])
+        cy += (leader["y"] - me["y"])
+    # Separation: personal space ~= half the rally radius; push off neighbours
+    # (other party members) inside it, weighted by closeness.
+    personal = max(TILE, cfg.rally_px * 0.5)
+    for p in members.values():
+        if p["id"] == me["id"]:
+            continue
+        d = dist_px(me["x"], me["y"], p["x"], p["y"])
+        if 0 < d < personal:
+            w = (personal - d) / personal          # 0 at edge, 1 when overlapping
+            cx += (me["x"] - p["x"]) / d * personal * w
+            cy += (me["y"] - p["y"]) / d * personal * w
+    # Avoidance: shove away from the nearest aggro threat in range.
+    threats = [m for m in snap["monsters"]
+               if m["hp"] > 0 and m["monsterType"] in AGGRO_MONSTERS
+               and dist_px(m["x"], m["y"], me["x"], me["y"]) <= cfg.threat_px]
+    if threats:
+        thr = min(threats, key=lambda m: dist_px(m["x"], m["y"], me["x"], me["y"]))
+        cx += (me["x"] - thr["x"])
+        cy += (me["y"] - thr["y"])
+    if abs(cx) < 1.0 and abs(cy) < 1.0:
+        return 0, 0                                # already well-placed -- hold
+    return nav_step(bot, me, me["x"] + cx, me["y"] + cy)
+
+
+def make_swarm(leader_name, cfg, focus_radius_px, is_leader, intent_mode="follow"):
     """One brain for both roles. Every tick:
 
       1. Compute party readiness (the shared P(win) score) from our snapshot.
       2. If ready AND there's a target -> everyone focus-fires the same monster.
-      3. If NOT ready -> rally: converge on the party while dodging aggro
-         threats (so we minimize non-combat exposure). The leader waits up here
-         too, so the pack never desyncs into a cross-map stroll.
+      3. If NOT ready -> hold station per `intent_mode` (follow/defend/magnetize)
+         while dodging aggro threats. The leader waits up here too, so the pack
+         never desyncs into a cross-map stroll.
+
+    `intent_mode` (one of INTENTS) shapes engagement + station-keeping; see the
+    INTENTS docstring. It only tweaks the gate and the non-combat step -- every
+    mode still shares the readiness model, so the hive stays coherent.
 
     is_leader only changes idle/fallback wandering, not the combat gate -- the
     leader obeys the same readiness rule as the escorts, which is what makes the
@@ -626,21 +716,33 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader):
         if not me:
             return
 
-        score, members, leader = party_readiness(snap, cfg, leader_name)
+        raw, members, leader = party_readiness(snap, cfg, leader_name)
+        score = smooth_readiness(bot, raw, cfg)
 
         # One-time visibility hint for a name mismatch / offline member.
         if not getattr(bot, "_swarm_greeted", False):
             bot._swarm_greeted = True
             role = "leading" if is_leader else f"escorting {leader_name!r}"
-            print(f"{role}; party={sorted(members)} readiness={score:.2f}",
-                  file=sys.stderr)
+            print(f"{role} [{intent_mode}]; party={sorted(members)} "
+                  f"readiness={score:.2f}", file=sys.stderr)
 
         anchor = leader or me
         target = pick_focus_monster(snap, anchor, focus_radius_px, cfg.hunt_types)
-        swarm_heartbeat(bot, f"escort {me['name']}", members, score, cfg, target, me)
+        # `attack` intent presses the offensive: it doesn't wait for a tight pack,
+        # so it gates on readiness EXCLUDING cohesion (health/threat still apply,
+        # so it won't charge in with a dying member or into un-assembled aggro).
+        # `defend`/`follow`/`magnetize` gate on the full readiness as usual.
+        if intent_mode == "attack":
+            gate_raw = readiness_without_cohesion(snap, cfg, leader_name)
+            gate_score = smooth_readiness(bot, gate_raw, cfg, slot="_gate_ema")
+        else:
+            gate_score = score
+        go = combat_go(bot, gate_score, cfg)
+        swarm_heartbeat(bot, f"escort {me['name']} [{intent_mode}]", members,
+                        score, cfg, target, me, fighting=go)
 
         # Gate: only fight when the squad is ready enough to win.
-        if target and score >= cfg.combat_threshold:
+        if target and go:
             if dist_px(me["x"], me["y"], target["x"], target["y"]) < ab.MELEE_RANGE_PX:
                 await bot.move(0, 0)
                 await bot.attack(target["id"])
@@ -648,10 +750,13 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader):
                 await bot.move(*nav_step(bot, me, target["x"], target["y"]))
             return
 
-        # Not ready (or nothing to fight): trail the leader directly so the
-        # column tracks him out of the house. Falls back to centroid regroup if
-        # the leader isn't visible this snapshot.
-        if leader:
+        # Not fighting: hold station per intent. magnetize self-spaces around the
+        # leader; the rest trail the leader directly (so the column tracks a
+        # moving leader). Falls back to centroid regroup if the leader isn't
+        # visible this snapshot.
+        if leader and intent_mode == "magnetize":
+            await bot.move(*magnetize_step(bot, me, leader, members, snap, cfg))
+        elif leader:
             await bot.move(*follow_leader_step(bot, me, leader, snap, cfg))
         elif len(members) > 1:
             await bot.move(*rally_step(me, members, snap, cfg, leader))
@@ -661,66 +766,34 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader):
     return intent
 
 
-def make_swarm_leader(cfg, focus_radius_px, route=None):
+def make_swarm_leader(cfg, focus_radius_px):
     """The leader's brain: identical readiness gate to the escorts, but it
     anchors the party on ITSELF (found via bot.me) rather than following anyone.
     So the leader waits up for a tight escort before initiating, using the very
     same P(win) score every escort computes -- keeping the pack in sync.
 
-    `route` is an optional list of (x_px, y_px) waypoints. The client has no
-    collision map, so we can't PLAN around walls -- instead the caller hands us a
-    known-walkable path and we walk it in order (bringing the pack) before
-    hunting locally at the end. This is what gets them out of the starter house
-    without orbiting a corner."""
-    route = route or []
+    Navigation is real A* (nav_step) over the extracted collision grid, so the
+    leader plans around walls on its own -- no hand-fed waypoint route needed to
+    escape the starter house."""
     async def intent(bot, snap):
         me = me_of(bot, snap)
         if not me:
             return
         # Anchor readiness on our own name so cohesion measures the escorts'
         # distance to us.
-        score, members, _ = party_readiness(snap, cfg, me["name"].lower())
+        raw, members, _ = party_readiness(snap, cfg, me["name"].lower())
+        score = smooth_readiness(bot, raw, cfg)
         leader = me  # the leader IS the anchor
 
         if not getattr(bot, "_swarm_greeted", False):
             bot._swarm_greeted = True
-            extra = f" route={len(route)}wp" if route else ""
-            print(f"leading; party={sorted(members)} readiness={score:.2f}{extra}",
+            print(f"leading; party={sorted(members)} readiness={score:.2f}",
                   file=sys.stderr)
 
-        # ROUTE: walk the given waypoints (in order) before hunting locally.
-        # Combat still preempts below, so a monster blocking the path gets
-        # fought; but with no target we follow the road, not the nearest rat.
-        wp_i = getattr(bot, "_route_i", 0)
-        if wp_i < len(route):
-            wx, wy = route[wp_i]
-            if dist_px(me["x"], me["y"], wx, wy) < WAYPOINT_REACHED_PX:
-                bot._route_i = wp_i + 1          # arrived -> next leg
-                wp_i += 1
-        if wp_i < len(route):
-            wx, wy = route[wp_i]
-            # Only advance the pack once cohesion is decent (same wait-up idea),
-            # so escorts don't get strung out between rooms.
-            cohesion = factor_cohesion(members, leader, snap, cfg)
-            hunting = getattr(bot, "_swarm_hunting", False)
-            hunting = cohesion >= (cfg.hunt_exit if hunting else cfg.hunt_enter)
-            bot._swarm_hunting = hunting
-            # Fight anything huntable already in range/ready even while enroute.
-            block = pick_focus_monster(snap, leader, focus_radius_px, cfg.hunt_types)
-            if not (block and score >= cfg.combat_threshold):
-                note = (f"enroute wp {wp_i+1}/{len(route)} -> "
-                        f"({wx/TILE:.0f},{wy/TILE:.0f}) "
-                        f"me@({me['x']/TILE:.0f},{me['y']/TILE:.0f}) coh={cohesion:.2f}")
-                swarm_heartbeat(bot, "lead", members, score, cfg, None, me, note=note)
-                if hunting:
-                    await bot.move(*nav_step(bot, me, wx, wy))
-                else:
-                    await bot.move(*rally_step(me, members, snap, cfg, leader))
-                return
-
         target = pick_focus_monster(snap, leader, focus_radius_px, cfg.hunt_types)
-        if target and score >= cfg.combat_threshold:
-            swarm_heartbeat(bot, "lead", members, score, cfg, target, me)
+        go = combat_go(bot, score, cfg)
+        if target and go:
+            swarm_heartbeat(bot, "lead", members, score, cfg, target, me, fighting=go)
             if dist_px(me["x"], me["y"], target["x"], target["y"]) < ab.MELEE_RANGE_PX:
                 await bot.move(0, 0)
                 await bot.attack(target["id"])
@@ -869,6 +942,10 @@ def build_intent(args):
         hunt = {h.strip() for h in args.hunt.split(",") if h.strip()}
         # "*" (or empty) means hunt anything -> None disables the type filter.
         hunt_types = None if (not hunt or "*" in hunt) else hunt
+        # Default hysteresis: keep fighting until 0.15 below the enter threshold,
+        # clamped to [0, threshold]. Explicit --combat-exit overrides.
+        combat_exit = (args.combat_exit if args.combat_exit is not None
+                       else max(0.0, args.threshold - 0.15))
         cfg = PartyConfig(
             member_names=[m.lower() for m in members],
             rally_px=args.rally * TILE,
@@ -878,21 +955,152 @@ def build_intent(args):
             cohesion_slack=args.cohesion_slack,
             hunt_enter=args.hunt_enter,
             hunt_exit=args.hunt_exit,
+            readiness_smooth=args.readiness_smooth,
+            combat_exit=combat_exit,
         )
         # A leader has no "leader_name" to follow, so it anchors on itself: use
         # its own display name once known. We pass "" and make_swarm falls back
         # to `me` as the anchor when leader can't be resolved.
         if is_leader:
             # The leader is itself part of the party for cohesion scoring.
-            route = parse_route(getattr(args, "route", ""))
-            return make_swarm_leader(cfg, args.focus_radius * TILE, route=route), None
+            return make_swarm_leader(cfg, args.focus_radius * TILE), None
         return make_swarm(leader_name, cfg, args.focus_radius * TILE,
-                          is_leader=False), None
+                          is_leader=False,
+                          intent_mode=getattr(args, "intent", "follow")), None
     if args.cmd == "move":
         return make_move(args.target), None
     if args.cmd == "send":
         return make_send(args.json), None
     sys.exit(f"unknown command {args.cmd}")
+
+
+# --------------------------------------------------------------------------
+# swarm launcher -- one command that spawns the whole hive
+# --------------------------------------------------------------------------
+
+def _resolve_display_name(accounts, account_user, character=None):
+    """Log into `account_user` once and return the display name of the chosen
+    character. Used so escorts get the exact in-world name to follow."""
+    acct = pick_account(accounts, account_user)
+    if acct is None:
+        sys.exit(f"swarm: no account named {account_user!r} in creds")
+    session, chars = ab.login(acct["username"], acct["password"])
+    return pick_character(chars, character).get("name")
+
+
+def run_swarm(args, accounts):
+    """Orchestrate the whole hive from one command: spawn one child `avalon.py`
+    process per bot (each its own account -- the server allows one character per
+    ACCOUNT in-world). Two modes:
+
+      * bot leader  (--leader ACCT): spawn ACCT as `lead`, plus every --escort as
+        `escort "<leader display name>"`.
+      * human leader (--follow NAME): spawn ONLY the escorts, all following the
+        human-controlled character NAME. This is the 'I'm the leader' hive -- you
+        move, the bots swarm you.
+
+    Ctrl-C tears the whole tree down."""
+    import subprocess
+    import shlex
+
+    escorts = [e.strip() for e in args.escort.split(",") if e.strip()]
+    if not escorts:
+        sys.exit("swarm: give at least one --escort <account>[:intent]")
+
+    # Escort membership names (for cohesion) = the escorts' display names plus
+    # the leader's. Resolve each escort account to its character name so members/
+    # readiness line up with what's actually in-world.
+    esc_specs = []          # (account, intent, display_name)
+    for spec in escorts:
+        acct, _, intent = spec.partition(":")
+        intent = intent or args.intent
+        if intent not in INTENTS:
+            sys.exit(f"swarm: unknown intent {intent!r}; choose from {INTENTS}")
+        disp = _resolve_display_name(accounts, acct.strip())
+        esc_specs.append((acct.strip(), intent, disp))
+
+    if args.leader and args.follow:
+        sys.exit("swarm: pass either --leader (bot leader) or --follow "
+                 "(human leader), not both")
+    if not args.leader and not args.follow:
+        sys.exit("swarm: pass --leader <account> (bot leads) or --follow "
+                 "<your character name> (you lead)")
+
+    if args.leader:
+        leader_name = _resolve_display_name(accounts, args.leader)
+    else:
+        leader_name = args.follow
+
+    member_names = [d for _, _, d in esc_specs] + [leader_name]
+    members_arg = ",".join(member_names)
+
+    # Shared swarm tuning passed to every child.
+    common = [
+        "--members", members_arg,
+        "--hunt", args.hunt,
+        "--rally", str(args.rally),
+        "--threat", str(args.threat),
+        "--threshold", str(args.threshold),
+        "--focus-radius", str(args.focus_radius),
+        "--cohesion-slack", str(args.cohesion_slack),
+        "--hunt-enter", str(args.hunt_enter),
+        "--hunt-exit", str(args.hunt_exit),
+        "--readiness-smooth", str(args.readiness_smooth),
+    ]
+    if args.combat_exit is not None:
+        common += ["--combat-exit", str(args.combat_exit)]
+
+    py = sys.executable
+    self_ = os.path.abspath(__file__)
+
+    def child_cmd(account, sub_args):
+        return [py, self_, "--creds", args.creds, "--account", account, *sub_args]
+
+    jobs = []               # (label, argv)
+    if args.leader:
+        jobs.append((f"lead:{args.leader}",
+                     child_cmd(args.leader, ["lead", *common])))
+    for acct, intent, _ in esc_specs:
+        jobs.append((f"escort:{acct}[{intent}]",
+                     child_cmd(acct, ["escort", leader_name,
+                                      "--intent", intent, *common])))
+
+    mode = f"bot-leader {leader_name!r}" if args.leader else f"human-leader {leader_name!r}"
+    print(f"swarm: {mode}; {len(jobs)} process(es):", file=sys.stderr)
+    for label, argv in jobs:
+        print(f"  {label}", file=sys.stderr)
+    if args.dry_run:
+        for label, argv in jobs:
+            print("$ " + " ".join(shlex.quote(a) for a in argv))
+        return
+
+    procs = []
+    try:
+        for label, argv in jobs:
+            procs.append((label, subprocess.Popen(argv)))
+        # Wait for any child to exit; when one dies, keep the rest running (a bot
+        # may just have been disconnected). Block until Ctrl-C.
+        while True:
+            alive = [p for _, p in procs if p.poll() is None]
+            if not alive:
+                print("swarm: all children exited", file=sys.stderr)
+                break
+            for label, p in procs:
+                try:
+                    p.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    continue
+    except KeyboardInterrupt:
+        print("\nswarm: stopping all children", file=sys.stderr)
+    finally:
+        for label, p in procs:
+            if p.poll() is None:
+                p.terminate()
+        for label, p in procs:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
 
 
 def main():
@@ -943,10 +1151,12 @@ def main():
         sp.add_argument("--hunt-exit", type=float, default=0.3,
                         help="cohesion below which the leader ABORTS advancing "
                              "back to regroup (default 0.3; must be < hunt-enter)")
-        sp.add_argument("--route", default="",
-                        help="leader only: ';'-separated 'x,y' tile waypoints to "
-                             "walk (in order) before hunting locally, e.g. "
-                             "'90,52;84,58;78,50'. Escorts trail automatically.")
+        sp.add_argument("--readiness-smooth", type=float, default=0.4,
+                        help="readiness EMA weight in (0,1]: smaller = stickier "
+                             "(1.0 = raw, no smoothing; default 0.4)")
+        sp.add_argument("--combat-exit", type=float, default=None,
+                        help="keep fighting until smoothed readiness drops below "
+                             "this (hysteresis; default = threshold-0.15)")
 
     ld = sub.add_parser("lead",
                         help="lead a party: wait up for a tight escort, then focus-fire")
@@ -955,7 +1165,30 @@ def main():
     e = sub.add_parser("escort",
                        help="follow a leader and focus-fire once the party is tight")
     e.add_argument("leader", help="name of the player to escort")
+    e.add_argument("--intent", choices=INTENTS, default="follow",
+                   help="hive behaviour: follow (trail+fight when ready), "
+                        "attack (press the offensive), defend (never chase, guard "
+                        "the leader), magnetize (self-space around the leader). "
+                        "Default follow.")
     add_swarm_args(e)
+
+    sw = sub.add_parser("swarm",
+                        help="ONE command that spawns the whole hive (leader + "
+                             "escorts, or just escorts following a human leader)")
+    sw.add_argument("--leader", metavar="ACCOUNT",
+                    help="account to run as the BOT leader (spawns `lead`)")
+    sw.add_argument("--follow", metavar="NAME",
+                    help="human-leader mode: your in-world character name; spawns "
+                         "ONLY escorts, all following you (no bot leader)")
+    sw.add_argument("--escort", default="", metavar="A[:INTENT],B[:INTENT]...",
+                    help="comma-separated escort accounts, each optionally with a "
+                         ":intent suffix (follow/attack/defend/magnetize), e.g. "
+                         "'haiku:magnetize,sonnet:defend,opus,fable'")
+    sw.add_argument("--intent", choices=INTENTS, default="follow",
+                    help="default intent for escorts without a :suffix (default follow)")
+    sw.add_argument("--dry-run", action="store_true",
+                    help="print the child commands instead of spawning them")
+    add_swarm_args(sw)
 
     m = sub.add_parser("move", help="walk to 'x,y' tile, a location name, or a player")
     m.add_argument("target")
@@ -965,6 +1198,13 @@ def main():
 
     args = p.parse_args()
     accounts = load_accounts(args)
+
+    # The swarm launcher is a pure orchestrator: it spawns child avalon.py
+    # processes and never opens its own socket, so short-circuit the login path.
+    if args.cmd == "swarm":
+        run_swarm(args, accounts)
+        return
+
     who = args.account or args.character
     acct = pick_account(accounts, who)
 

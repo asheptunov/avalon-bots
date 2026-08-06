@@ -15,19 +15,54 @@ They pathfind around walls (A*), converge tightly (cohesion ~0.93), and
 focus-fire rats together, roaming the field for the next target. Verified live:
 all five engage; sustained kills.
 
-Bots are currently **stopped** (turned off at user request).
+Since the live run, three follow-ups landed (built + unit-tested, **not yet
+live-smoke-tested**): readiness EMA + combat hysteresis, waypoint removal, and a
+one-command `swarm` launcher with a **human-leader mode** and per-escort
+**intents** (the "hive").
 
-### How to run it (today)
-One process per character, each its own account (server allows one character per
-ACCOUNT in-world at a time). From the repo dir:
+Bots are currently **stopped** (turned off at user request). Next live test:
+human-leader mode with Sam/the user leading.
+
+### How to run it — one command (new)
+The `swarm` subcommand spawns the whole hive from a single invocation (still one
+child process per character, since the server allows one char per ACCOUNT).
+
+Bot leads:
 ```
-python avalon.py --account dario_amodei lead   --members haiku,sonnet,opus,fable --hunt rat
-python avalon.py --account haiku  escort "Dario Amodei" --members haiku,sonnet,opus,fable --hunt rat
-python avalon.py --account sonnet escort "Dario Amodei" --members haiku,sonnet,opus,fable --hunt rat
-python avalon.py --account opus   escort "Dario Amodei" --members haiku,sonnet,opus,fable --hunt rat
-python avalon.py --account fable  escort "Dario Amodei" --members haiku,sonnet,opus,fable --hunt rat
+python avalon.py swarm --leader dario_amodei --escort haiku,sonnet,opus,fable --hunt rat
 ```
-(A one-command launcher is a planned improvement — see Open items.)
+YOU lead (human-leader mode — spawns only bot escorts that follow your
+character; no bot leader). Give your in-world character name:
+```
+python avalon.py swarm --follow "Sam Altman" --escort haiku,sonnet,opus,fable --hunt rat
+```
+Per-escort intents via a `:suffix` (or a default `--intent`):
+```
+python avalon.py swarm --follow "Sam Altman" \
+  --escort "haiku:magnetize,sonnet:defend,opus:attack,fable:follow"
+```
+`--dry-run` prints the child commands (and resolves account→character names)
+without spawning. Old per-shell `lead`/`escort` commands still work.
+
+### Escort intents (the hive)
+Each escort runs the SAME readiness model but shapes engagement + station-keeping:
+- **follow** (default) — trail the leader; focus-fire with the pack when ready.
+- **attack** — press the offensive: engages passive prey (rats) even when the
+  pack isn't clustered. Gates on readiness *excluding cohesion*, so it still
+  respects the health floor (won't charge with a dying member) and won't rush
+  un-assembled into auto-aggro monsters (factor_threat folds cohesion back in
+  when aggro is near).
+- **defend** — never chases; only fights monsters that enter the leader's focus
+  radius. Otherwise stays tight on the leader.
+- **magnetize** — boids-like: pull toward the leader + short-range repulsion
+  from neighbours (+ threat avoidance), so escorts self-space evenly yet stay
+  clustered. No coordination channel — emergent from the local rule.
+
+**What determines if the party attacks:** every bot independently picks
+`pick_focus_monster` (nearest-to-leader huntable in focus range) and attacks it
+*if* its readiness gate is open. There's no comms, so followers don't read the
+leader's literal target — they converge on the *same* pick by running the same
+selector on near-identical snapshots. Implicit focus-fire, not command-following.
 
 ---
 
@@ -87,22 +122,23 @@ python avalon.py --account fable  escort "Dario Amodei" --members haiku,sonnet,o
 
 ## Open items
 
-Requested next (in priority order):
+Next up:
 
-1. **Readiness EMA + combat hysteresis** — the instantaneous readiness jitters
-   (0.61↔0.88 tick-to-tick), so the combat gate flips. Smooth readiness with an
-   EMA and add combat-gate hysteresis (enter at `combat_threshold`, keep
-   fighting until a lower `combat_exit`). Parameterized. *(started; not done)*
-2. **Remove vestigial waypoints** — A* obsoletes `--route`/`WAYPOINT_REACHED_PX`
-   /`route_advance`/`nearest_route_index`. Strip it (or keep as manual override).
-3. **One-command launcher** — spin up leader + N escorts from a single command
-   instead of N shells. Should support **optional human leader** (a mode where
-   the user IS the leader and only bot escorts are spawned).
+- **Live smoke-test the human-leader hive** — run `swarm --follow "<my char>"`
+  with the four escorts (mixed intents) and confirm: they follow the *human*
+  leader, magnetize self-spaces, defend guards, attack presses. Not yet run.
+- **Verify EMA/hysteresis defaults feel right live** — defaults are
+  `--readiness-smooth 0.4`, `--combat-exit = threshold-0.15`. The good farming
+  run didn't actually show gate-flipping (cohesion sat ~0.93), so this is
+  insurance for marginal packs; confirm it doesn't make engagement feel sluggish.
 
 Deferred / nice-to-have:
 
 - **Auto-reconnect** on `websockets ConnectionClosedError` (server dropped all
   bots once and killed the swarm; reconnect would make it resilient).
+- **More intents / factors** — the hive is extensible: add intents (e.g.
+  "orbit", "screen") the same way, and readiness factors by appending to
+  `READINESS_FACTORS`.
 
 ## Done
 
@@ -113,3 +149,9 @@ Deferred / nice-to-have:
 - [x] Tile-mapping fix (round vs floor).
 - [x] `where` shows z + raw px.
 - [x] Committed: `feat(nav): A* pathfinding over extracted collision maps + leader/escort swarm`.
+- [x] Readiness EMA (`--readiness-smooth`) + combat-gate hysteresis
+  (`--combat-exit`). Bot-local EMA, independent slots. Unit-tested.
+- [x] Removed vestigial waypoint routing (`--route` and all `route_*` helpers).
+- [x] One-command `swarm` launcher: bot-leader (`--leader`) or human-leader
+  (`--follow`) mode, spawns child processes, tears down on Ctrl-C.
+- [x] Escort intents: follow / attack / defend / magnetize (the hive).
