@@ -266,6 +266,12 @@ class AvalonBot:
     async def harvest(self, node_id):
         await self.send({"type": "harvest", "nodeId": node_id})
 
+    async def use_teleport(self):
+        """Interact with a ladder teleport under/near the character (server picks
+        the teleport by your position). Holes (mode 'walk') need no message -- you
+        transition by walking onto the tile; this is only for 'interact' ladders."""
+        await self.send({"type": "useTeleport"})
+
     async def use_item(self, instance_id):
         await self.send({"type": "useItem", "instanceId": instance_id})
 

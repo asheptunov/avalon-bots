@@ -68,11 +68,38 @@ def parse_rows(arr_literal):
     return rows
 
 
+# Surface (z=0) holes are hardcoded in the client (the `pa` list, all mode:"walk"
+# -> z=-1) rather than living in a `teleports` array like the underground floors.
+# Their coords are literal in the bundle (oa,ia,... = {tx,ty}); resolved here.
+# Each descends to z=-1 at the same tile (client sets toTile=fromTile for holes).
+SURFACE_HOLES = [(58, 22), (20, 78), (101, 8), (103, 101), (82, 99), (62, 99)]
+
+
+def _parse_teleports(lit):
+    """Parse a `[{tileX:..,tileY:..,toTileX:..,toTileY:..,toZ:..,oneWay:!0/!1,
+    mode:"walk"/"interact"},...]` array literal into a list of dicts."""
+    out = []
+    for tm in re.finditer(
+            r'\{tileX:(-?\d+),tileY:(-?\d+),toTileX:(-?\d+),toTileY:(-?\d+),'
+            r'toZ:(-?\d+),oneWay:!(\d),mode:"(walk|interact)"\}', lit):
+        out.append({
+            "fromTile": [int(tm.group(1)), int(tm.group(2))],
+            "toTile": [int(tm.group(3)), int(tm.group(4))],
+            "toZ": int(tm.group(5)),
+            "oneWay": tm.group(6) == "0",      # !0 == true, !1 == false
+            "mode": tm.group(7),               # walk = hole, interact = ladder
+        })
+    return out
+
+
 def extract(js):
-    i = js.find("const ui=[{z:")
-    if i < 0:
-        sys.exit("zone table `ui` not found in bundle")
-    start = js.index("[", i)
+    # The zone table is an array of {z,widthTiles,heightTiles,rows,teleports}.
+    # Its variable name has changed across bundle builds (was `const ui=`), so
+    # anchor on the array shape itself: the first `[{z:<int>,widthTiles:`.
+    m = re.search(r"\[\{z:-?\d+,widthTiles:", js)
+    if not m:
+        sys.exit("zone table not found in bundle (layout changed?)")
+    start = m.start()
     end = match_bracket(js, start)
     lit = js[start:end]
 
@@ -88,7 +115,18 @@ def extract(js):
         if len(rows) != h:
             print(f"  warn: z={z} parsed {len(rows)} rows, header says {h}",
                   file=sys.stderr)
-        zones[z] = {"widthTiles": w, "heightTiles": h, "rows": rows}
+        # Teleports for this zone (if any) follow the rows array before the next
+        # zone. Slice from rows_end to the next `{z:` (or the array end).
+        nxt = lit.find("{z:", zm.end())
+        seg = lit[rows_end: nxt if nxt >= 0 else len(lit)]
+        tp = []
+        tm = re.search(r"teleports:\[", seg)
+        if tm:
+            tp_open = seg.index("[", tm.start())
+            tp_end = match_bracket(seg, tp_open)
+            tp = _parse_teleports(seg[tp_open:tp_end])
+        zones[z] = {"widthTiles": w, "heightTiles": h, "rows": rows,
+                    "teleports": tp}
     return zones
 
 
@@ -125,11 +163,16 @@ def main():
     if bundle_path != src:
         open(bundle_path, "w", encoding="utf-8").write(js)
 
-    zones = extract(js)                       # underground z=-1..-6 (ASCII rows)
+    zones = extract(js)                       # underground z=-1..-6 (ASCII+teleports)
     z0 = extract_z0(bundle_path)              # surface z=0 (procedural -> Node)
     if z0:
+        # Surface holes (all walk-over -> z=-1) are hardcoded, not in a teleports
+        # array; synthesize them so escorts can descend from the surface.
+        z0_tp = [{"fromTile": [tx, ty], "toTile": [tx, ty], "toZ": -1,
+                  "oneWay": False, "mode": "walk"} for (tx, ty) in SURFACE_HOLES]
         zones[0] = {"widthTiles": z0["widthTiles"],
-                    "heightTiles": z0["heightTiles"], "rows": z0["rows"]}
+                    "heightTiles": z0["heightTiles"], "rows": z0["rows"],
+                    "teleports": z0_tp}
 
     with open(out, "w", encoding="utf-8") as f:
         json.dump(zones, f)
@@ -137,8 +180,9 @@ def main():
         zn = zones[z]
         blocked = sum(row.count("#") for row in zn["rows"])
         tot = zn["widthTiles"] * zn["heightTiles"]
+        ntp = len(zn.get("teleports", []))
         print(f"z={z}: {zn['widthTiles']}x{zn['heightTiles']}  "
-              f"blocked={blocked}/{tot} ({100*blocked/tot:.0f}%)")
+              f"blocked={blocked}/{tot} ({100*blocked/tot:.0f}%)  teleports={ntp}")
     print(f"wrote {out}")
 
 

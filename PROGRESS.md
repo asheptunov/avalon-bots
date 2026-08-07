@@ -133,6 +133,37 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
   `floor`. Flooring caused a half-tile mismatch that pinned bots at walls.
   `avalon_nav._tile` uses round.
 
+## Z-transitions / following the leader between floors
+
+- **Mechanic (from the bundle):** each zone has `teleports` markers, two kinds:
+  - `mode:"walk"` = **hole** — step onto the tile, server auto-transitions you
+    (no message).
+  - `mode:"interact"` = **ladder** — get within ~1.5 tiles and send
+    `{type:"useTeleport"}` (server picks the teleport by your position). Added
+    `AvalonBot.use_teleport()`.
+  - Each marker has a fixed dest `(toTile, toZ)`. Surface z=0 has 6 holes → z=-1
+    (hardcoded in the client, not a teleports array — synthesized in extraction).
+    Underground floors have holes down + ladders up; graph is bidirectional.
+- **Extracted into `avalon_maps.json`** (`extract_maps.py` now also parses
+  `teleports`; anchor was made robust — the zone-array var name changed from
+  `const ui=` to an anonymous array). `avalon_nav.teleports(z)` /
+  `nearest_teleport(z, to_z, from_tile, mode)`.
+- **THE HARD PART — other floors are invisible:** the snapshot only contains
+  entities on the VIEWER's own floor (every player/monster is stamped with the
+  viewer's z). So when the leader descends, they simply VANISH from the escorts'
+  snapshots — there's no "leader moved to z=-1" signal.
+- **Follow heuristic (last-seen-hole, no comms):** each escort remembers the
+  leader's floor+tile while visible (`track_leader`). When the leader vanishes
+  AND was last seen on a different floor, the escort heads to the teleport on ITS
+  floor nearest the leader's last-seen tile and takes it (walk onto a hole, or
+  approach a ladder + `useTeleport`) — `follow_across_floors`. After
+  transitioning, z updates, it re-sees the leader, normal follow resumes.
+  - Limitation: guesses the nearest teleport; can pick wrong if the leader took a
+    far/second teleport before the escort caught up. Good enough for "you walked
+    into a hole they were trailing you toward."
+  - **NOT yet live-tested** — the whole z-follow path (incl. whether walk-holes
+    transition a bot exactly like the browser) needs an in-game run.
+
 ## Key facts / constraints
 
 - **One character per ACCOUNT** in-world at a time (not per character). N bots

@@ -666,6 +666,68 @@ def rally_step(me, members, snap, cfg, leader):
     return step_toward(me, tx, ty)
 
 
+# How close (px) an escort must get to a ladder tile before it can `useTeleport`.
+# The client uses ~1.5 tiles; match it (a touch tighter to be safely in range).
+TELEPORT_INTERACT_PX = TILE * 1.4
+
+
+async def follow_across_floors(bot, me, snap):
+    """Follow a leader who has DESCENDED/ASCENDED and thus vanished from our
+    snapshot (the server only sends entities on our own floor). We can't see
+    which teleport they took, so we use the last-seen-hole heuristic: head to the
+    teleport on OUR floor nearest to where the leader was last seen, and take it
+    (walk onto a hole; get close to a ladder and `useTeleport`). After the
+    transition our z changes, we re-see the leader, and normal follow resumes.
+
+    Returns True if it issued a move/teleport this tick (caller should return),
+    False if there's nothing to do (no last-seen leader, or no matching teleport)."""
+    seen = getattr(bot, "_leader_last", None)
+    if not seen:
+        return False
+    lz, ltile = seen["z"], seen["tile"]
+    z = getattr(bot, "z", 0)
+    # If the leader was last seen on OUR floor, they didn't change floors (they
+    # just walked out of view); don't chase a teleport.
+    if lz == z:
+        return False
+
+    # Which teleport on our floor reaches the leader's floor, nearest to where we
+    # last saw them? (Prefer one that reaches lz directly; fall back to any.)
+    tp = nav.nearest_teleport(z, lz, ltile) or (
+        min((t for t in nav.teleports(z)),
+            key=lambda t: (t["fromTile"][0] - ltile[0]) ** 2
+            + (t["fromTile"][1] - ltile[1]) ** 2, default=None))
+    if not tp:
+        return False
+
+    ftx, fty = tp["fromTile"]
+    goal_px = (ftx * TILE, fty * TILE)
+    d = dist_px(me["x"], me["y"], *goal_px)
+    if tp["mode"] == "walk":
+        # Hole: step onto the tile; the server transitions us automatically.
+        await bot.move(*nav_step(bot, me, *goal_px))
+    else:
+        # Ladder: get within interact range, then send useTeleport.
+        if d <= TELEPORT_INTERACT_PX:
+            await bot.move(0, 0)
+            await bot.use_teleport()
+        else:
+            await bot.move(*nav_step(bot, me, *goal_px))
+    if not getattr(bot, "_xfloor_note", False) or bot._xfloor_note != (z, lz):
+        bot._xfloor_note = (z, lz)
+        print(f"escort {me['name']}: leader on z{lz}, taking {tp['mode']} "
+              f"@({ftx},{fty}) from z{z}", file=sys.stderr)
+    return True
+
+
+def track_leader(bot, leader):
+    """Remember the leader's floor+tile whenever we can see them, so if they
+    vanish (changed floors) we know where to chase (follow_across_floors)."""
+    if leader:
+        bot._leader_last = {"z": getattr(bot, "z", 0),
+                            "tile": (nav._tile(leader["x"]), nav._tile(leader["y"]))}
+
+
 def follow_leader_step(bot, me, leader, snap, cfg):
     """A (dx,dy) that trails the LEADER (not the party centroid), so the column
     tracks a moving leader out of the house instead of converging on itself.
@@ -855,6 +917,7 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
 
         raw, members, leader = party_readiness(snap, cfg, leader_name)
         score = smooth_readiness(bot, raw, cfg)
+        track_leader(bot, leader)          # remember floor+tile while visible
 
         # One-time visibility hint for a name mismatch / offline member.
         if not getattr(bot, "_swarm_greeted", False):
@@ -893,12 +956,13 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
 
         # Not fighting: hold station per FORMATION. magnetize self-spaces around
         # the leader; otherwise trail the leader directly (so the column tracks a
-        # moving leader). Falls back to centroid regroup if the leader isn't
-        # visible this snapshot.
+        # moving leader).
         if leader and formation == "magnetize":
             await bot.move(*magnetize_step(bot, me, leader, members, snap, cfg))
         elif leader:
             await bot.move(*follow_leader_step(bot, me, leader, snap, cfg))
+        elif await follow_across_floors(bot, me, snap):
+            return                          # leader changed floors -> chase down/up
         elif len(members) > 1:
             await bot.move(*rally_step(me, members, snap, cfg, leader))
         else:

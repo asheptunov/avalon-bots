@@ -30,12 +30,35 @@ def load_maps(path=None):
     raw = json.load(open(path, encoding="utf-8"))
     for zk, zn in raw.items():
         _MAPS[int(zk)] = {
-            "w": zn["widthTiles"], "h": zn["heightTiles"], "rows": zn["rows"]}
+            "w": zn["widthTiles"], "h": zn["heightTiles"], "rows": zn["rows"],
+            "teleports": zn.get("teleports", [])}
     return _MAPS
 
 
 def have_map(z):
     return int(z) in load_maps()
+
+
+def teleports(z):
+    """Teleport markers on floor z: list of dicts with fromTile [tx,ty], toTile,
+    toZ, mode ('walk'=hole, step onto it; 'interact'=ladder, send useTeleport
+    within ~1.5 tiles), oneWay. Empty if the floor/map is unknown."""
+    m = load_maps().get(int(z))
+    return m["teleports"] if m else []
+
+
+def nearest_teleport(z, to_z, from_tile, mode=None):
+    """The teleport on floor `z` that leads to `to_z` and is closest to
+    `from_tile` (tx,ty). Optionally require a mode ('walk'/'interact'). Returns
+    the teleport dict or None. Used to follow a leader who changed floors: head
+    to the nearest marker that reaches their floor."""
+    cands = [t for t in teleports(z)
+             if t["toZ"] == to_z and (mode is None or t["mode"] == mode)]
+    if not cands:
+        return None
+    fx, fy = from_tile
+    return min(cands, key=lambda t: (t["fromTile"][0] - fx) ** 2
+               + (t["fromTile"][1] - fy) ** 2)
 
 
 def walkable(z, tx, ty):
