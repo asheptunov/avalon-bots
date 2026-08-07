@@ -30,6 +30,7 @@ import asyncio
 import json
 import math
 import os
+import random
 import sys
 import time
 
@@ -241,6 +242,55 @@ async def respawn_if_dead(bot, me):
 HEAL_POTIONS = [("healthPotion", 30), ("largeHealthPotion", 60)]
 # NPC types / names that offer a heal dialogue option.
 HEALER_NAMES = {"brother aldric", "aldric"}
+# The server ignores potions drunk faster than this.
+POTION_COOLDOWN_S = 0.8
+
+
+def useful_potion(bot, me):
+    """The smallest held potion whose heal wouldn't mostly overheal, as
+    (item, amount), or None.
+
+    The `missing >= amt * 0.5` rule is why this is shared rather than inlined:
+    it's the policy that stops us burning a 60-point potion on a 5-point graze,
+    and both `heal` and `farm` must apply it identically."""
+    missing = me["maxHp"] - me["hp"]
+    for pid, amt in HEAL_POTIONS:
+        it = bot.find_item(pid)
+        if it and missing >= amt * 0.5:
+            return it, amt
+    return None
+
+
+async def drink_potion(bot, me, prefix=""):
+    """Drink a useful potion if one is held and the cooldown has elapsed.
+
+    Returns True if we drank. Shared by `heal` (one-shot) and `farm` (repeating)
+    so the overheal rule and the cooldown can't drift apart between them."""
+    now = _now()
+    if now - getattr(bot, "_heal_last_drink", 0.0) < POTION_COOLDOWN_S:
+        return False
+    found = useful_potion(bot, me)
+    if not found:
+        return False
+    potion, amt = found
+    bot._heal_last_drink = now
+    print(f"{prefix}drinking {potion['itemId']} "
+          f"(+{amt}, x{bot.count_item(potion['itemId'])} held)")
+    await bot.use_item(potion["instanceId"])
+    return True
+
+
+def find_npc(snap, query=None):
+    """The first NPC matching `query` (forgivingly, like find_player), or the
+    first known healer when no query is given."""
+    for n in snap["npcs"]:
+        name, kind = n.get("name") or "", n.get("npcType") or ""
+        if query:
+            if name_matches(query, name) or name_matches(query, kind):
+                return n
+        elif name.lower() in HEALER_NAMES or kind.lower() in HEALER_NAMES:
+            return n
+    return None
 
 
 def make_heal(force_healer=False):
@@ -259,26 +309,14 @@ def make_heal(force_healer=False):
             bot.done = True
             return
 
-        # 1) Drink potions while one would actually help. A potion only counts if
-        #    the missing HP is at least half its heal value -- otherwise the
-        #    overheal is wasted, so we stop and let regen finish the last sliver
-        #    rather than spamming useItem (which the server just ignores).
+        # 1) Drink potions while one would actually help; once none does, stop
+        #    and let regen finish the last sliver rather than spamming useItem.
         if not force_healer:
-            now = _now()
-            missing = me["maxHp"] - me["hp"]
-            last_drink = getattr(bot, "_heal_last_drink", 0.0)
-            useful = [(bot.find_item(pid), amt) for pid, amt in HEAL_POTIONS
-                      if bot.find_item(pid) and missing >= amt * 0.5]
-            if useful:
-                potion, amt = useful[0]
-                if now - last_drink < 0.8:   # server has a short potion cooldown
-                    return
-                print(f"hp {me['hp']}/{me['maxHp']} -- drinking {potion['itemId']} "
-                      f"(+{amt}, x{bot.count_item(potion['itemId'])} held)")
-                await bot.use_item(potion["instanceId"])
-                bot._heal_last_drink = now
+            if await drink_potion(bot, me, prefix=f"hp {me['hp']}/{me['maxHp']} -- "):
                 return
-            if last_drink:
+            if useful_potion(bot, me):
+                return          # holding one, just waiting out the cooldown
+            if getattr(bot, "_heal_last_drink", 0.0):
                 held = sum(bot.count_item(pid) for pid, _ in HEAL_POTIONS)
                 tail = ("out of health potions" if not held
                         else "close enough (regen will finish)")
@@ -287,9 +325,7 @@ def make_heal(force_healer=False):
                 return
 
         # 2) Head to a healer NPC and use their dialogue.
-        healer = next((n for n in snap["npcs"]
-                       if n.get("name", "").lower() in HEALER_NAMES
-                       or n.get("npcType", "").lower() in HEALER_NAMES), None)
+        healer = find_npc(snap)
         if not healer:
             print(f"hp {me['hp']}/{me['maxHp']} -- no healer NPC nearby. "
                   "Move to Brother Aldric, then run `heal` again.")
@@ -312,32 +348,35 @@ def make_heal(force_healer=False):
     return intent
 
 
-async def heal_on_event(bot, msg):
+def make_heal_on_event(one_shot=True):
     """Dialogue handler for the Aldric heal path: when the dialogue arrives,
     pick the option whose label looks like healing and send it back.
 
-    `heal` is a one-shot and exits after this; `farm` heals repeatedly over a
-    long run, so it sets `bot.heal_once = False` to keep the loop alive."""
-    if msg.get("type") != "dialogue":
-        return
-    if msg.get("npcId") != getattr(bot, "_heal_npc", None):
-        return
-    opts = msg.get("options") or []
-    heal_opt = next((o for o in opts
-                     if "heal" in (o.get("label", "") + o.get("id", "")).lower()
-                     or "cure" in o.get("label", "").lower()), None)
-    if heal_opt:
-        print(f"  picking dialogue option: {heal_opt.get('label')!r}")
-        await bot.talk_to(bot._heal_npc, heal_opt["id"])
-    else:
-        labels = [o.get("label") for o in opts]
-        print(f"  no heal option in dialogue; options were: {labels}")
-    # Close the dialogue so the NPC isn't left mid-conversation on a long run.
-    if not getattr(bot, "heal_once", True):
+    `one_shot` is the difference between the two callers: `heal` is a one-shot
+    command and exits once healed, while `farm` heals many times over a long run
+    and must close the dialogue and carry on instead."""
+    async def on_event(bot, msg):
+        if msg.get("type") != "dialogue":
+            return
+        if msg.get("npcId") != getattr(bot, "_heal_npc", None):
+            return
+        opts = msg.get("options") or []
+        heal_opt = next((o for o in opts
+                         if "heal" in (o.get("label", "") + o.get("id", "")).lower()
+                         or "cure" in o.get("label", "").lower()), None)
+        if heal_opt:
+            print(f"  picking dialogue option: {heal_opt.get('label')!r}")
+            await bot.talk_to(bot._heal_npc, heal_opt["id"])
+        else:
+            labels = [o.get("label") for o in opts]
+            print(f"  no heal option in dialogue; options were: {labels}")
+        if one_shot:
+            bot.done = True
+            return
+        # Leave the NPC cleanly so the next retreat can re-open the dialogue.
         await bot.send({"type": "endDialogue"})
         bot._heal_npc = None
-        return
-    bot.done = True
+    return on_event
 
 
 def make_follow(target_name, keep_px):
@@ -751,6 +790,38 @@ async def follow_across_floors(bot, me, snap):
     return True
 
 
+async def home_to_surface(bot, me):
+    """Last-resort recovery for an escort stranded underground with NO leader in
+    view and nothing to chase: climb toward the surface one floor at a time via
+    the known up-teleports, until it reaches z=0 and can re-acquire the leader.
+    This is the 'get everyone back to me' path -- it uses the fully-known teleport
+    graph (we DO remember where every ladder goes) to route home.
+
+    Returns True if it acted (caller should return); False on the surface / no way
+    up (nothing to do here)."""
+    z = getattr(bot, "z", 0)
+    if z >= 0:
+        return False                    # already on the surface
+    up = nav.nearest_upward_teleport(z, (nav._tile(me["x"]), nav._tile(me["y"])))
+    if not up:
+        return False
+    ftx, fty = up["fromTile"]
+    goal_px = (ftx * TILE, fty * TILE)
+    if up["mode"] == "walk":
+        await bot.move(*nav_step(bot, me, *goal_px))
+    else:
+        if dist_px(me["x"], me["y"], *goal_px) <= TELEPORT_INTERACT_PX:
+            await bot.move(0, 0)
+            await bot.use_teleport()
+        else:
+            await bot.move(*nav_step(bot, me, *goal_px))
+    if getattr(bot, "_home_note", None) != (z, ftx, fty):
+        bot._home_note = (z, ftx, fty)
+        print(f"escort {me['name']}: no leader in sight on z{z} -- homing to "
+              f"surface via {up['mode']} @({ftx},{fty})", file=sys.stderr)
+    return True
+
+
 def track_leader(bot, leader):
     """Remember the leader's floor+tile whenever we can see them, so if they
     vanish next to a teleport we know to chase them through it. Clear it once we
@@ -759,6 +830,7 @@ def track_leader(bot, leader):
         bot._leader_last = {"z": getattr(bot, "z", 0),
                             "tile": (nav._tile(leader["x"]), nav._tile(leader["y"]))}
         bot._xfloor_note = None         # re-armed: fresh sighting
+        bot._home_note = None
 
 
 def follow_leader_step(bot, me, leader, snap, cfg):
@@ -997,7 +1069,9 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
         elif leader:
             await bot.move(*follow_leader_step(bot, me, leader, snap, cfg))
         elif await follow_across_floors(bot, me, snap):
-            return                          # leader changed floors -> chase down/up
+            return                          # leader vanished at a teleport -> chase
+        elif await home_to_surface(bot, me):
+            return                          # stranded underground -> climb home
         elif len(members) > 1:
             await bot.move(*rally_step(me, members, snap, cfg, leader))
         else:
@@ -1113,11 +1187,8 @@ FOOD_ITEMS = [
     ("cookedMeat", 480), ("fish", 1200), ("cheese", 240),
     ("apple", 120), ("avocado", 120), ("iceCream", 120), ("rawMeat", 180),
 ]
-# Raw -> what it becomes when you interact with it near a fire.
-COOKABLE = {"rawMeat": "cookedMeat"}
-# Junk we never bother picking up (nothing yet -- rats drop little, and gold
-# stacks to a single slot, so by default we take everything).
-LOOT_IGNORE: set = set()
+# Raw food that becomes something better when you interact with it near a fire.
+COOKABLE = {"rawMeat"}
 
 # How close we must be to a ground item before `moveItem` will pick it up.
 LOOT_REACH_PX = TILE * 1.2
@@ -1125,40 +1196,46 @@ LOOT_REACH_PX = TILE * 1.2
 LOOT_TIMEOUT_S = 6.0
 
 
-def lootable_items(bot, snap, ignore=LOOT_IGNORE):
-    """Ground items we're allowed to take, nearest first.
+def nearest_loot(bot, snap, me):
+    """The nearest ground item we're allowed to take, or None.
 
     The server reserves fresh drops for whoever earned them (`ownerId` +
     `ownerExpiresAt`); taking someone else's is refused, so we filter to loot
     that is ours or unowned rather than burning ticks on a rejected pickup.
     Items we already failed to reach are skipped so one stuck drop behind a wall
     can't stall the farm forever."""
-    me = me_of(bot, snap)
-    if not me:
-        return []
     skip = getattr(bot, "_farm_loot_skip", frozenset())
-    items = []
-    for g in (snap.get("groundItems") or []):
-        if g["item"].get("itemId") in ignore or g["id"] in skip:
-            continue
-        owner = g.get("ownerId")
-        if owner and owner != bot.me:
-            continue
-        items.append(g)
-    return sorted(items, key=lambda g: dist_px(g["x"], g["y"], me["x"], me["y"]))
+    mine = [g for g in (snap.get("groundItems") or [])
+            if g["id"] not in skip
+            and not (g.get("ownerId") and g["ownerId"] != bot.me)]
+    if not mine:
+        return None
+    return min(mine, key=lambda g: dist_px(g["x"], g["y"], me["x"], me["y"]))
 
 
 def pick_food(bot, emergency=False):
-    """Choose what to eat: the shortest-lasting food that still feeds us, so
-    long-lasting food is saved. In an emergency (hurt and starving) any food
-    will do -- being fed at all is what restores regen."""
-    held = [(iid, secs) for iid, secs in FOOD_ITEMS if bot.find_item(iid)]
+    """Choose what to eat, returning the held item (or None).
+
+    Normally: the SHORTEST-lasting food we hold, so the good stuff is saved for
+    when it matters (any food restores regen equally -- only the duration of the
+    wellFed window differs, so a 2-minute apple does the same job right now as a
+    20-minute sushi).
+
+    In an emergency (hurt and starving): the LONGEST-lasting food, so we don't
+    have to break off mid-retreat to eat again while something is hitting us.
+
+    One pass over the inventory, not one per food type: `iter_items` walks every
+    equipment slot and container recursively, and this runs on a 10 Hz loop."""
+    wanted = dict(FOOD_ITEMS)
+    held = {}
+    for it in bot.iter_items():
+        secs = wanted.get(it.get("itemId"))
+        if secs is not None:
+            held.setdefault(it["itemId"], (secs, it))
     if not held:
         return None
-    if emergency:
-        return min(held, key=lambda p: p[1])[0]
-    # Prefer the cheapest adequate option; FOOD_ITEMS order breaks ties.
-    return min(held, key=lambda p: p[1])[0]
+    best = max if emergency else min
+    return best(held.values(), key=lambda p: p[0])[1]
 
 
 class FarmConfig:
@@ -1333,18 +1410,11 @@ async def farm_eat_step(bot, me, cfg):
                   "Farming continues but retreats will take a while.")
         return False
     bot._farm_warned_food = False
-    it = bot.find_item(food)
     bot._farm_last_eat = now
-    print(f"  eating {food} (x{bot.count_item(food)} held) -- restoring regen")
-    await bot.use_item(it["instanceId"])
+    print(f"  eating {food['itemId']} (x{bot.count_item(food['itemId'])} held)"
+          " -- restoring regen")
+    await bot.use_item(food["instanceId"])
     return True
-
-
-def farm_threats(snap, me, hunt_types):
-    """Living monsters worth fighting, nearest first."""
-    out = [m for m in snap["monsters"] if m["hp"] > 0
-           and (not hunt_types or m["monsterType"] in hunt_types)]
-    return sorted(out, key=lambda m: dist_px(m["x"], m["y"], me["x"], me["y"]))
 
 
 def retreat_step(bot, me, snap, cfg):
@@ -1352,10 +1422,7 @@ def retreat_step(bot, me, snap, cfg):
     safe spot and the heal is there); otherwise just put distance between us and
     the nearest monster."""
     if cfg.healer_name:
-        healer = next((n for n in snap["npcs"]
-                       if name_matches(cfg.healer_name,
-                                       n.get("name") or n.get("npcType") or "")),
-                      None)
+        healer = find_npc(snap, cfg.healer_name)
         if healer:
             if dist_px(me["x"], me["y"], healer["x"], healer["y"]) > TILE * 1.5:
                 return nav_step(bot, me, healer["x"], healer["y"]), healer
@@ -1388,17 +1455,9 @@ def make_farm(cfg):
         if not me:
             return
         set_nav_obstacles(bot, snap, me)
-        # Farming heals many times over a long run, so the dialogue handler must
-        # not treat the first heal as the end of the job.
-        bot.heal_once = False
 
-        if me["hp"] <= 0:
-            if not getattr(bot, "_farm_dead", False):
-                bot._farm_dead = True
-                print("died -- respawning")
-            await bot.send({"type": "respawn"})
+        if await respawn_if_dead(bot, me):
             return
-        bot._farm_dead = False
 
         frac = me["hp"] / max(1, me["maxHp"])
 
@@ -1430,18 +1489,21 @@ def make_farm(cfg):
             return
 
         # --- fight ------------------------------------------------------
-        monsters = farm_threats(snap, me, cfg.hunt_types)
-        if monsters:
-            m = monsters[0]
+        m = nearest_huntable(snap, me, cfg.hunt_types)
+        if m:
             d = dist_px(m["x"], m["y"], me["x"], me["y"])
             if d < ab.MELEE_RANGE_PX:
                 await bot.move(0, 0)
                 await bot.attack(m["id"])
-                farm_log(bot, f"FIGHT {m['monsterType']} "
-                              f"{m['hp']}/{m['maxHp']} hp={me['hp']}")
+                # FIGHT and CHASE are one state for logging: closing the last
+                # few px flips between them several times a second, which would
+                # defeat the print-on-change throttle.
+                farm_log(bot, "FIGHT", lambda: f"{m['monsterType']} "
+                                               f"{m['hp']}/{m['maxHp']} hp={me['hp']}")
             else:
                 await bot.move(*nav_step(bot, me, m["x"], m["y"]))
-                farm_log(bot, f"CHASE {m['monsterType']} {d/TILE:.1f} tiles")
+                farm_log(bot, "FIGHT",
+                         lambda: f"chasing {m['monsterType']} {d/TILE:.1f} tiles")
             return
 
         # --- nothing to fight: loot, then keep house --------------------
@@ -1462,22 +1524,13 @@ def make_farm(cfg):
 
 
 async def farm_heal_at(bot, me, healer, cfg):
-    """At the healer while retreating: drink if a potion helps, else use the
-    heal dialogue. Reuses the same option-picking handler as `heal`."""
-    target_hp = me["maxHp"] * cfg.heal_to_frac
-    if me["hp"] >= target_hp:
+    """At the healer while retreating: drink if a potion helps, else ask for the
+    heal dialogue. Both mechanisms are shared with the `heal` command."""
+    if me["hp"] >= me["maxHp"] * cfg.heal_to_frac:
+        return
+    if await drink_potion(bot, me, prefix="  "):
         return
     now = _now()
-    missing = me["maxHp"] - me["hp"]
-    if now - getattr(bot, "_heal_last_drink", 0.0) >= 0.8:
-        useful = [(bot.find_item(pid), amt) for pid, amt in HEAL_POTIONS
-                  if bot.find_item(pid) and missing >= amt * 0.5]
-        if useful:
-            potion, amt = useful[0]
-            bot._heal_last_drink = now
-            print(f"  drinking {potion['itemId']} (+{amt})")
-            await bot.use_item(potion["instanceId"])
-            return
     if now - getattr(bot, "_farm_last_talk", 0.0) >= 3.0:
         bot._farm_last_talk = now
         bot._heal_npc = healer["id"]
@@ -1496,30 +1549,32 @@ async def farm_roam_step(bot, me, snap, cfg):
     if (goal is None
             or now - getattr(bot, "_farm_roam_since", 0.0) > 20.0
             or dist_px(me["x"], me["y"], goal[0], goal[1]) <= TILE * 1.5):
-        import random
         ang = random.uniform(0, 2 * math.pi)
         r = random.uniform(cfg.roam_px * 0.4, cfg.roam_px)
         goal = (me["x"] + math.cos(ang) * r, me["y"] + math.sin(ang) * r)
         bot._farm_roam_goal = goal
         bot._farm_roam_since = now
-    farm_log(bot, "ROAM (no prey in sight)")
+    farm_log(bot, "ROAM", lambda: "(no prey in sight)")
     await bot.move(*nav_step(bot, me, goal[0], goal[1]))
 
 
-def farm_log(bot, msg, period=5.0):
-    """Heartbeat: farming runs for hours, so print state on a timer rather than
-    at 10 Hz. Always prints when the state changes."""
+def farm_log(bot, state, detail=None, period=5.0):
+    """Heartbeat: farming runs for hours, so print on a timer rather than at
+    10 Hz. Always prints when `state` changes.
+
+    `detail` is a callable, not a string: it's only rendered when we actually
+    print, so the ~98% of ticks that are throttled cost no formatting at all."""
     now = _now()
-    state = msg.split()[0]
     changed = state != getattr(bot, "_farm_state", None)
-    if changed or now - getattr(bot, "_farm_last_log", 0.0) >= period:
-        bot._farm_state = state
-        bot._farm_last_log = now
-        free, cap = bot.pack_space()
-        gold = bot.count_item("gold")
-        pack = f"  pack {cap-free}/{cap}" if cap else ""
-        fed = "" if bot.has_status("wellFed") else "  HUNGRY"
-        print(f"[farm] {msg}{pack}  gold={gold}{fed}")
+    if not (changed or now - getattr(bot, "_farm_last_log", 0.0) >= period):
+        return
+    bot._farm_state = state
+    bot._farm_last_log = now
+    free, cap = bot.pack_space()
+    pack = f"  pack {cap-free}/{cap}" if cap else ""
+    fed = "" if bot.has_status("wellFed") else "  HUNGRY"
+    text = f"{state} {detail()}" if detail else state
+    print(f"[farm] {text}{pack}  gold={bot.count_item('gold')}{fed}")
 
 
 def make_send(raw):
@@ -1573,7 +1628,7 @@ def build_intent(args):
     if args.cmd == "respawn":
         return intent_respawn, None
     if args.cmd == "heal":
-        return make_heal(force_healer=args.healer), heal_on_event
+        return make_heal(force_healer=args.healer), make_heal_on_event()
     if args.cmd == "farm":
         hunt = {h.strip() for h in args.hunt.split(",") if h.strip()}
         cfg = FarmConfig(
@@ -1590,8 +1645,9 @@ def build_intent(args):
             until_hp_frac=(args.until_hp / 100.0
                            if args.until_hp is not None else None),
         )
-        # The heal dialogue at the healer reuses `heal`'s option picker.
-        return make_farm(cfg), heal_on_event
+        # Reuse `heal`'s option picker, in repeating mode: farming heals many
+        # times over a long run, so a heal must not end the job.
+        return make_farm(cfg), make_heal_on_event(one_shot=False)
     if args.cmd == "follow":
         return make_follow(args.target, args.keep * TILE), None
     if args.cmd in ("escort", "lead"):

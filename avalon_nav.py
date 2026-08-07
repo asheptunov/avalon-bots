@@ -61,6 +61,18 @@ def nearest_teleport(z, to_z, from_tile, mode=None):
                + (t["fromTile"][1] - fy) ** 2)
 
 
+def nearest_upward_teleport(z, from_tile):
+    """The teleport on floor `z` that goes UP (toZ > z), nearest `from_tile`, or
+    None if this floor has no way up (the surface). Used to home a stranded bot
+    back toward the surface one floor at a time -- follow the up-ladders."""
+    up = [t for t in teleports(z) if t["toZ"] > z]
+    if not up:
+        return None
+    fx, fy = from_tile
+    return min(up, key=lambda t: (t["fromTile"][0] - fx) ** 2
+               + (t["fromTile"][1] - fy) ** 2)
+
+
 def walkable(z, tx, ty):
     m = load_maps().get(int(z))
     if not m:

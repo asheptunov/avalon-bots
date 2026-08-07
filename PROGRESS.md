@@ -166,9 +166,15 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
   tile). `_xfloor_note` re-arms on every fresh sighting.
   - Limitation: guesses the nearest teleport to the last-seen tile; fine for
     "you stepped into the hole they were trailing you toward."
-  - **Live status:** first live run FAILED (the z≠mine trigger never fired; one
-    escort drifted down and got stuck). Trigger reworked + unit-tested; re-test
-    pending.
+- **Homing recovery (`home_to_surface`):** an escort stranded underground with NO
+  leader in view and nothing to chase climbs toward the surface one floor at a
+  time via the nearest UP teleport (`nav.nearest_upward_teleport`), until it hits
+  z=0 and re-acquires the leader. Uses the fully-known teleport graph. This is
+  the "get everyone back to me" path for bots that got separated. Unit-tested.
+- **Auto-respawn** (`respawn_if_dead`): swarm bots respawn on death (they WILL
+  die underground) instead of lying as a corpse.
+  - **Live status:** first run FAILED (bad trigger). Trigger reworked, plus
+    homing + respawn added, all unit-tested. Full live re-test still pending.
 
 ## Key facts / constraints
 
