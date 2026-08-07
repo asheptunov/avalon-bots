@@ -1,0 +1,21 @@
+{
+  "name": "avalon-bots",
+  "version": "0.2.0",
+  "description": "Avalon MMO bot: one core, two transports (browser userscript + headless CLI)",
+  "type": "module",
+  "bin": {
+    "avalon": "src/cli/main.js"
+  },
+  "scripts": {
+    "test": "node --test test/test_port.mjs test/test_nav.mjs test/test_farm.mjs test/test_swarm.mjs test/test_intents.mjs test/test_maps.mjs test/test_bundle.mjs",
+    "build": "python build.py",
+    "maps": "node src/cli/main.js maps"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

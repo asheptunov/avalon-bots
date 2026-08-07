@@ -5,16 +5,20 @@
 // intent on each decoded snapshot, so the bot ticks at exactly the rate the
 // server updates and never busy-waits.
 
-import { installHook, makeSender } from './hook.js';
-import { AvalonBot } from './bot.js';
-import { makeFarm, FarmConfig, meOf } from './farm.js';
-import * as nav from './nav.js';
+import { installHook, makeSender } from './transport/browser.js';
+import { extractFromPage } from './transport/pagemaps.js';
+import { AvalonBot } from './core/bot.js';
+import { makeFarm, FarmConfig, meOf, handleDialogue } from './core/farm.js';
+import * as nav from './core/nav.js';
 import { createPanel } from './ui.js';
 
-// EMBEDDED_MAPS is injected by build.js from avalon_maps.json.
+// EMBEDDED_MAPS is injected by build.py from avalon_maps.json -- a fallback
+// only; the maps we actually use are extracted from the running client.
 /* global EMBEDDED_MAPS */
 
 function boot() {
+  // Load the embedded snapshot immediately so the bot is never map-less, then
+  // replace it with maps read from the live client. See loadLiveMaps().
   nav.loadMaps(EMBEDDED_MAPS);
 
   let bot = null;
@@ -27,23 +31,30 @@ function boot() {
   };
 
   /**
-   * Compare the maps' build-time stamp against the client the page is actually
-   * running. The collision maps are GENERATED from the game bundle, so a
-   * redeploy moves trees and water and silently invalidates them -- the bot then
-   * paths into walls the map thinks are open. Python re-extracts on startup; a
-   * userscript can't, but it CAN notice, which turns a baffling failure into a
-   * named one with a fix attached.
+   * Replace the embedded maps with ones extracted from the client the page is
+   * actually running.
+   *
+   * The collision maps are GENERATED from the game bundle, so a redeploy moves
+   * trees and water and invalidates any baked-in copy -- silently, surfacing
+   * only as a bot that walks into a wall the map thinks is open. Extracting from
+   * the live bundle makes that failure mode structurally impossible: the maps
+   * cannot disagree with the client, because they come from it.
+   *
+   * The embedded snapshot is already loaded and stays in place if this fails,
+   * so a bad extract degrades to "possibly stale" rather than "no maps at all".
    */
-  function reportMapFreshness() {
+  async function loadLiveMaps() {
     const built = nav.mapBundle();
-    if (!built) return;
-    const el = document.querySelector('script[type=module][src*="/assets/index-"]');
-    const live = el && el.getAttribute('src');
-    if (live && live !== built) {
-      log(`!! MAPS ARE STALE -- built from ${built}, game is running ${live}. `
-          + 'Re-run: python extract_maps.py && python web/build.py');
-    } else {
-      log(`maps from bundle ${built}`);
+    try {
+      const { maps } = await extractFromPage();
+      nav.loadMaps(maps);
+      log(maps.bundle === built
+        ? `maps extracted from the live client (${maps.bundle})`
+        : `maps re-extracted -- client is ${maps.bundle}, build had ${built}`);
+    } catch (e) {
+      log(`!! could not extract maps from the live client (${e.message}); `
+          + `falling back to the embedded set from ${built}. If the game has `
+          + 'updated since that build, expect pinning on obstacles.');
     }
   }
 
@@ -59,7 +70,7 @@ function boot() {
       if (msg?.type === 'welcome') {
         log(`joined as ${msg.name}`);
         panel?.enable(true);
-        reportMapFreshness();
+        loadLiveMaps();
       }
       if (msg?.type === 'joinRejected') log(`!! join rejected: ${msg.reason || ''}`);
     },
@@ -88,6 +99,7 @@ function boot() {
   });
 
   bot = new AvalonBot(makeSender(state));
+  bot.onJsonMessage((b, msg) => handleDialogue(b, msg, log));
 
   function start(opts) {
     if (!bot.joined) { log('!! not joined yet -- wait for the world to load'); return; }

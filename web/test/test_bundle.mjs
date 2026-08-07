@@ -15,7 +15,7 @@ const BUNDLE = new URL('../avalon-farm.user.js', import.meta.url);
 const code = readFileSync(BUNDLE, 'utf8');
 
 /** A minimal DOM + WebSocket good enough to boot the userscript. */
-function makeEnv({ liveBundle = null } = {}) {
+function makeEnv({ liveBundle = null, bundleText = null } = {}) {
   const listeners = new Map();
   const sent = [];
   let socket = null;
@@ -80,11 +80,17 @@ function makeEnv({ liveBundle = null } = {}) {
   };
 
   const sandbox = {
-    window: {}, document, console: { log() {}, error() {} },
+    window: {}, document, console: { log() {}, error() {}, warn() {} },
     performance: { now: () => Date.now() },
     TextEncoder, TextDecoder, DataView, Uint8Array, ArrayBuffer, Math, JSON,
     Set, Map, Object, Array, Number, String, Boolean, Error, Infinity,
-    setTimeout, clearTimeout,
+    setTimeout, clearTimeout, Promise, Function,
+    // The script re-extracts collision maps from the bundle the page is running.
+    // `bundleText: null` models that fetch failing, which must degrade to the
+    // embedded maps rather than leaving the bot with none.
+    fetch: (url) => (bundleText == null
+      ? Promise.reject(new Error('offline'))
+      : Promise.resolve({ ok: true, status: 200, url, text: () => Promise.resolve(bundleText) })),
   };
   sandbox.window.WebSocket = FakeWS;
   sandbox.WebSocket = FakeWS;
@@ -278,23 +284,56 @@ test('a handler error never escapes into the page', () => {
     'a decode failure must be contained, not thrown at the game');
 });
 
-test('a stale map warns loudly, a fresh one does not', () => {
-  const stale = makeEnv({ liveBundle: '/assets/index-DIFFERENT.js' });
-  vm.runInContext(code, stale.sandbox);
-  const ws1 = new stale.sandbox.window.WebSocket('wss://avalon.juanandresleon.com/');
+// The collision maps are generated FROM the client, so a redeploy invalidates
+// any baked-in copy -- silently, as a bot walking into a wall the map thinks is
+// open. The script therefore re-extracts from the bundle the page is actually
+// running. When that fails it must say so and keep the embedded set, because
+// having no maps at all degrades A* to greedy movement and looks like "the bot
+// is stuck on a rock".
+test('a failed live map extract falls back to the embedded maps and says so', async () => {
+  const env = makeEnv({ liveBundle: '/assets/index-DIFFERENT.js', bundleText: null });
+  vm.runInContext(code, env.sandbox);
+  const ws = new env.sandbox.window.WebSocket('wss://avalon.juanandresleon.com/');
   const logs = [];
-  stale.sandbox.console.log = (...a) => logs.push(a.join(' '));
-  ws1.emit('message', { data: JSON.stringify({ type: 'welcome', id: 'me', name: 'Me' }) });
-  assert.ok(logs.some((l) => l.includes('MAPS ARE STALE')),
-    'a client redeploy must be named, not silently mispathed');
+  env.sandbox.console.log = (...a) => logs.push(a.join(' '));
+  ws.emit('message', { data: JSON.stringify({ type: 'welcome', id: 'me', name: 'Me' }) });
+  await new Promise((r) => setTimeout(r, 10));   // let the extract promise settle
 
-  // The embedded stamp matches what the page is running -> no warning.
-  const built = JSON.parse(code.match(/const EMBEDDED_MAPS = (\{.*?\});\n/s)[1]).bundle;
-  const fresh = makeEnv({ liveBundle: built });
-  vm.runInContext(code, fresh.sandbox);
-  const ws2 = new fresh.sandbox.window.WebSocket('wss://avalon.juanandresleon.com/');
-  const ok = [];
-  fresh.sandbox.console.log = (...a) => ok.push(a.join(' '));
-  ws2.emit('message', { data: JSON.stringify({ type: 'welcome', id: 'me', name: 'Me' }) });
-  assert.ok(!ok.some((l) => l.includes('STALE')), 'matching maps must not warn');
+  const all = logs.join(' ');
+  assert.match(all, /could not extract maps/i,
+    'a failed extract must be named, not silently mispathed');
+  assert.match(all, /embedded/i, 'and it must say what it fell back to');
+});
+
+test('maps are re-extracted from the bundle the page is running', async () => {
+  // A minimal bundle carrying just the underground zone table -- enough for the
+  // extractor to find and parse. (The surface generator needs the real client,
+  // and its absence is a warned-about partial, not a failure.)
+  const rows = Array.from({ length: 4 }, (_, y) => (y === 0 || y === 3 ? '####' : '#..#'));
+  const fakeBundle = `var x=[{z:-1,widthTiles:4,heightTiles:4,rows:${JSON.stringify(rows)},`
+    + 'teleports:[{tileX:1,tileY:1,toTileX:2,toTileY:2,toZ:-2,oneWay:!1,mode:"walk"}]}];';
+
+  const env = makeEnv({ liveBundle: '/assets/index-LIVE.js', bundleText: fakeBundle });
+  vm.runInContext(code, env.sandbox);
+  const ws = new env.sandbox.window.WebSocket('wss://avalon.juanandresleon.com/');
+  const logs = [];
+  env.sandbox.console.log = (...a) => logs.push(a.join(' '));
+  ws.emit('message', { data: JSON.stringify({ type: 'welcome', id: 'me', name: 'Me' }) });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const all = logs.join(' ');
+  assert.match(all, /index-LIVE\.js/,
+    'the maps in use must come from the client the page is running');
+  assert.ok(!/could not extract/i.test(all), 'and it must not have fallen back');
+});
+
+test('the embedded maps are a usable fallback (real grids, not a stub)', () => {
+  const embedded = JSON.parse(code.match(/const EMBEDDED_MAPS = (\{.*?\});\n/s)[1]);
+  assert.ok(embedded.bundle, 'stamped with the bundle it came from');
+  for (const z of ['0', '-1']) {
+    const zone = embedded[z];
+    assert.ok(zone, `z=${z} present`);
+    assert.equal(zone.rows.length, zone.heightTiles, 'row count matches the header');
+    assert.ok(zone.rows.some((r) => r.includes('#')), 'has real walls');
+  }
 });

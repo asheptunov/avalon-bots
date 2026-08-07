@@ -34,7 +34,13 @@ export class AvalonBot {
     this.stats = {};         // authoritative stats from welcome/playerStats
     this.done = false;
     this.joined = false;
+    // Extra JSON-frame listeners, see onJson. Not per-run state: these are
+    // installed once at wiring time and must survive a farm restart.
+    this.jsonHandlers = [];
   }
+
+  /** Register a JSON-frame listener, e.g. the healer dialogue handler. */
+  onJsonMessage(fn) { this.jsonHandlers.push(fn); }
 
   // ---- outbound ---------------------------------------------------------
 
@@ -156,6 +162,13 @@ export class AvalonBot {
         break;
       default:
         break;
+    }
+    // Behaviours that must answer JSON (the healer dialogue) register here.
+    // Kept as a hook rather than an import so bot.js stays behaviour-agnostic
+    // and every transport gets it for free -- a transport that forgot to call
+    // it would silently break healing, which is exactly how that bug happened.
+    for (const fn of this.jsonHandlers) {
+      try { fn(this, msg); } catch (e) { console.error('[avalon] json handler:', e); }
     }
   }
 

@@ -1,5 +1,18 @@
+# Credentials never belong in the repo. They now live in ~/.avalon/creds.json,
+# but keep these patterns so an old checkout can't reintroduce them.
 creds.json
 creds.json.*
+
+# Node
+node_modules/
+
+# Fetched game client + generated collision maps. Both are derived from
+# whatever the game is currently serving, so committing them just bakes in a
+# snapshot that goes stale on the next deploy. The build fetches them fresh, and
+# `avalon_maps.json` / `web/maps.json` are the fallback the build embeds.
+_bundle.js
+_bundle*.js
+
+# Python leftovers (the stack the JS port replaced)
 __pycache__/
 *.pyc
-_bundle.js

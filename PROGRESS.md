@@ -8,6 +8,45 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## ⚠️ 2026-08-07 — ported to JavaScript; the Python stack is gone
+
+Everything below this banner describes the **Python** implementation, which has
+been replaced by the JS one under `web/` and deleted (it remains in git history).
+The game mechanics, the reasoning, and the hard-won rules are all still accurate
+and worth reading — **only the file names and commands are stale.**
+
+Translation table:
+
+| Python (deleted) | Now |
+|---|---|
+| `python avalon.py <cmd> --account X` | `node web/src/cli/main.js <cmd> --account X` |
+| `python extract_maps.py` | `node web/src/cli/main.js maps --out web/maps.json` |
+| `python test_farm.py` | `cd web && npm test` |
+| `avalon.py`, `avalon_bot.py` | `web/src/core/{farm,swarm,bot,protocol}.js` |
+| `avalon_nav.py` | `web/src/core/nav.js` |
+| `extract_maps.py` + `extract_z0.js` | `web/src/core/maps.js` |
+| `avalon_maps.json` | `web/maps.json` (build fallback only — see below) |
+| `creds.json` in-repo | `~/.avalon/creds.json`, or `AVALON_USER`/`AVALON_PASS` |
+
+What actually changed in behaviour, not just in spelling:
+
+- **The swarm runs in ONE process.** Python needed a child process per character
+  because a blocking socket loop drives one; Node's event loop holds them all.
+- **Collision maps can no longer go stale.** The CLI re-extracts from the live
+  client on startup, and the userscript extracts from the bundle *the page is
+  running*. `web/maps.json` is only a fallback for a failed extract.
+- **There is a browser userscript** (`web/avalon-farm.user.js`) that rides the
+  game page's own WebSocket, so it coexists with you playing — no second
+  connection for the server to reject, and no credentials.
+- **Two fixed bugs that the Python still has**: `factor_cohesion` double-counted
+  the leader whenever the member query differed from the display name (a stacked
+  party scored 0.5, so the combat gate never opened), and the healer path opened
+  the dialogue without ever picking the heal option.
+
+See `web/README.md` for current usage.
+
+---
+
 ## Current state (2026-08-05)
 
 **The swarm works and farms.** Dario leads; haiku/sonnet/opus/fable escort.

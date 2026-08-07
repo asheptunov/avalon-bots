@@ -1,0 +1,83 @@
+name: Release
+
+# Tampermonkey auto-update works by periodically fetching @updateURL and
+# comparing its @version against the installed one. build.mjs points both
+# @updateURL and @downloadURL at this repo's "latest release" asset, which is a
+# STABLE url that always resolves to the newest release -- so publishing a
+# release here is all it takes for every installed copy to update itself.
+#
+# Push a tag to cut a release:
+#   git tag v0.2.1 && git push origin v0.2.1
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.2.1)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install
+        working-directory: web
+        run: npm ci || npm install
+
+      # A broken release auto-installs itself onto every user, so the tests are
+      # a gate here, not a formality.
+      - name: Test
+        working-directory: web
+        run: npm test
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract maps from the live client
+        working-directory: web
+        continue-on-error: true
+        run: node src/cli/main.js maps --out maps.json
+
+      - name: Build userscript
+        working-directory: web
+        env:
+          AVALON_VERSION: ${{ steps.ver.outputs.version }}
+        run: node build.mjs
+
+      # Tampermonkey silently refuses to install a script it can't parse, and the
+      # user just sees "nothing happens". Catch it here instead.
+      - name: Verify the built script parses
+        working-directory: web
+        run: node --check avalon-farm.user.js
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          name: v${{ steps.ver.outputs.version }}
+          files: web/avalon-farm.user.js
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            [**Install / update the userscript**](https://github.com/asheptunov/avalon-bots/releases/latest/download/avalon-farm.user.js)
+            (needs [Tampermonkey](https://www.tampermonkey.net/)).
+
+            Already installed? Tampermonkey picks this up on its own update check
+            — no action needed.

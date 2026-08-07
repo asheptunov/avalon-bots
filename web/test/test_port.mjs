@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 // Import via file:// URLs -- on Windows a bare absolute path ('C:\...') is not
 // a valid ESM specifier.
-const SRC = new URL('../src/', import.meta.url);
+const SRC = new URL('../src/core/', import.meta.url);
 const load = (m) => import(new URL(m, SRC).href);
 
 const { decodeSnapshot, encodeMove, encodeAttack, Reader, TILE } =

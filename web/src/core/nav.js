@@ -1,15 +1,18 @@
-// Grid navigation: A* over the extracted collision maps. Port of avalon_nav.py.
+// Grid navigation: A* over the extracted collision maps.
 //
-// The maps come from extract_maps.py (avalon_maps.json), embedded into the
-// userscript at build time -- one ASCII grid per z-level where '#' is blocked.
-// That grid is bit-exact with what the server enforces, so A* over it yields
-// real paths around walls.
+// The maps come from core/maps.js -- one ASCII grid per z-level where '#' is
+// blocked. That grid is bit-exact with what the server enforces, so A* over it
+// yields real paths around walls.
 //
-// Note the map is GENERATED from the client bundle. The Python side re-extracts
-// when the game ships a new client (refresh_maps_if_stale); here we can't run
-// the extractor, so a game redeploy can silently stale the map. `mapBundle()`
-// exposes the stamp we were built from; main.js compares it against the bundle
-// the page is actually running and warns on a mismatch.
+// The maps are GENERATED from the client bundle, so a game redeploy invalidates
+// any stale copy. Neither runtime relies on one: the CLI re-extracts on startup,
+// and the userscript extracts from the bundle the page is actually running.
+// `mapBundle()` exposes which client the loaded set came from.
+//
+// A* alone is not sufficient, because it plans in whole TILES while movement
+// happens in PIXELS. `pathStep` closes that gap with centre steering and
+// `safeStep`; without them a valid tile-by-tile plan can still emit a step that
+// clips a wall corner and nets zero movement.
 
 import { TILE } from './protocol.js';
 
@@ -274,12 +277,48 @@ export function pathStep(bot, me, z, goalPx, blocked = null, repathTiles = 3) {
 
   const tiles = bot.run.path.tiles;
   if (!tiles || !tiles.length) {
-    // Unreachable -> greedy nudge, so we at least press toward the goal.
-    return [Math.sign(goalPx[0] - me.x), Math.sign(goalPx[1] - me.y)];
+    // Unreachable -> nudge toward the goal so we at least press in its
+    // direction (a goal behind a wall is often reachable once we've moved).
+    // Routed through safeStep: an unguarded nudge is exactly the case that
+    // walks into the wall separating us from the goal and stays there.
+    return safeStep(z, sx, sy,
+      Math.sign(goalPx[0] - me.x), Math.sign(goalPx[1] - me.y), block);
   }
   // Consume tiles we've already reached.
   while (tiles.length && tiles[0][0] === sx && tiles[0][1] === sy) tiles.shift();
   if (!tiles.length) return [0, 0];
   const [nx, ny] = tiles[0];
-  return [Math.sign(nx - sx), Math.sign(ny - sy)];
+
+  // Steer toward the CENTRE of the next tile in pixel space, not a raw tile
+  // sign. When the bot straddles a tile boundary next to a wall corner, a raw
+  // sign-step can clip the wall and net zero movement; aiming at the tile centre
+  // pulls it into the lane first, so it clears the corner. We still emit dx,dy
+  // in {-1,0,1} (the only move the protocol has), just computed from the
+  // sub-tile offset rather than from whole tiles.
+  const tcx = nx * TILE;                 // server tiles are round(px/TILE)-based
+  const tcy = ny * TILE;
+  const eps = TILE * 0.2;
+  const dx = (tcx - me.x > eps ? 1 : 0) - (tcx - me.x < -eps ? 1 : 0);
+  const dy = (tcy - me.y > eps ? 1 : 0) - (tcy - me.y < -eps ? 1 : 0);
+  return safeStep(z, sx, sy, dx, dy, block);
+}
+
+/**
+ * Never command a move that walks straight into a wall, or onto a tile another
+ * player occupies. On a blocked diagonal -- including one that merely clips a
+ * wall corner -- fall back to whichever single axis is free.
+ *
+ * This is the last line of defence: A* plans over tiles, but we move in pixels,
+ * so between plan and step the bot can end up commanding a diagonal that shaves
+ * a corner and nets zero movement. Without this it reads as "the bot froze
+ * against a tree".
+ */
+export function safeStep(z, sx, sy, dx, dy, blocked = new Set()) {
+  if (dx === 0 && dy === 0) return [0, 0];
+  const diagonalClips = dx && dy
+    && !(free(z, sx + dx, sy, blocked) && free(z, sx, sy + dy, blocked));
+  if (free(z, sx + dx, sy + dy, blocked) && !diagonalClips) return [dx, dy];
+  if (dx && free(z, sx + dx, sy, blocked)) return [dx, 0];
+  if (dy && free(z, sx, sy + dy, blocked)) return [0, dy];
+  return [0, 0];
 }

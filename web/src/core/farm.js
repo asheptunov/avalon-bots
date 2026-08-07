@@ -64,7 +64,7 @@ export function navStep(bot, me, tx, ty) {
  * as a reduce that compares `dist(best)` inline costs two hypots per element,
  * and these scans run over every monster on screen at 10 Hz.
  */
-function nearestTo(xs, anchor) {
+export function nearestTo(xs, anchor) {
   let best = null; let bestD = Infinity;
   for (const x of xs) {
     const d = distPx(x.x, x.y, anchor.x, anchor.y);
@@ -85,7 +85,7 @@ export function nearestHuntable(snap, anchor, huntTypes) {
 }
 
 // HP-restoring potions, smallest first (bundle: healthPotion 30, large 60).
-const HEAL_POTIONS = [['healthPotion', 30], ['largeHealthPotion', 60]];
+export const HEAL_POTIONS = [['healthPotion', 30], ['largeHealthPotion', 60]];
 const HEALER_NAMES = new Set(['brother aldric', 'aldric']);
 const POTION_COOLDOWN_S = 0.8;
 const TELEPORT_INTERACT_PX = TILE * 1.5;
@@ -107,7 +107,7 @@ export function findNpc(snap, query = null) {
  * The smallest held potion whose heal wouldn't mostly overheal, or null. The
  * `missing >= amt/2` rule stops us burning a 60-point potion on a 5-point graze.
  */
-function usefulPotion(bot, me) {
+export function usefulPotion(bot, me) {
   const missing = me.maxHp - me.hp;
   for (const [pid, amt] of HEAL_POTIONS) {
     const it = bot.findItem(pid);
@@ -116,7 +116,7 @@ function usefulPotion(bot, me) {
   return null;
 }
 
-function drinkPotion(bot, me, log) {
+export function drinkPotion(bot, me, log) {
   if (since(bot, 'healLastDrink') < POTION_COOLDOWN_S) return false;
   const t = now();
   const found = usefulPotion(bot, me);
@@ -128,8 +128,13 @@ function drinkPotion(bot, me, log) {
   return true;
 }
 
-/** Dead bots can't fight. Respawn (throttled) and skip the tick. */
-function respawnIfDead(bot, me, log) {
+/**
+ * Dead bots can't fight. Respawn (throttled) and skip the tick.
+ *
+ * Swarm bots WILL die (especially to underground monsters), so they need to get
+ * back up on their own -- a corpse can't fight or follow.
+ */
+export function respawnIfDead(bot, me, log) {
   if (me.hp > 0) return false;
   if (since(bot, 'respawnLast') > 2.0) {
     bot.run.respawnLast = now();
@@ -211,7 +216,7 @@ function nearestLoot(bot, snap, me) {
  * saved (any food restores regen equally -- only the wellFed duration differs).
  * In an emergency the LONGEST, so we don't break off mid-retreat to eat again.
  */
-function pickFood(bot, emergency = false) {
+export function pickFood(bot, emergency = false) {
   const held = new Map();
   for (const it of bot.iterItems()) {
     const secs = FOOD_SECONDS.get(it.itemId);
@@ -396,8 +401,15 @@ function eatStep(bot, me, cfg, log) {
   return true;
 }
 
-/** Move onto / interact with a teleport marker. True once triggered. */
-function takeTeleport(bot, me, tp) {
+/**
+ * Move onto / interact with a teleport marker. True once triggered.
+ *
+ * The two modes differ in how you trigger them, which is why this is shared with
+ * the swarm: a 'walk' hole transitions you the moment you stand on the tile (no
+ * message at all), while an 'interact' ladder needs you within ~1.5 tiles and
+ * then an explicit useTeleport.
+ */
+export function takeTeleport(bot, me, tp) {
   const [ftx, fty] = tp.fromTile;
   const goal = [ftx * TILE, fty * TILE];
   if (tp.mode === 'walk') {
@@ -490,8 +502,38 @@ function healAt(bot, me, healer, cfg, log) {
   if (since(bot, 'farmLastTalk') >= 3.0) {
     bot.run.farmLastTalk = now();
     log?.(`asking ${healer.name} for a heal (${me.hp}/${me.maxHp})`);
+    // Opening the dialogue is only half of it: the heal itself is a dialogue
+    // OPTION, and its id is dynamic, so we note who we're talking to and let
+    // handleDialogue pick the option when the reply arrives.
+    bot.run.healNpc = healer.id;
     bot.talkTo(healer.id);
   }
+}
+
+/**
+ * Answer a healer's dialogue by choosing the heal option.
+ *
+ * Wired into bot.onJson rather than the snapshot tick because dialogue arrives
+ * as JSON, and the farm loop only ever sees binary snapshots. Without this the
+ * bot opens the dialogue and stands there: `talkTo` alone heals nobody, so a
+ * retreating bot would wait at the healer until something killed it.
+ */
+export function handleDialogue(bot, msg, log) {
+  if (msg?.type !== 'dialogue') return false;
+  if (!bot.run.healNpc || msg.npcId !== bot.run.healNpc) return false;
+  const opts = msg.options || [];
+  const heal = opts.find((o) => /heal|cure/i.test(`${o.label || ''}${o.id || ''}`));
+  if (heal) {
+    log?.(`picking dialogue option: ${heal.label}`);
+    bot.talkTo(bot.run.healNpc, heal.id);
+  } else {
+    log?.(`no heal option; saw: ${opts.map((o) => o.label).join(', ')}`);
+  }
+  // Close the dialogue so the next retreat can re-open it. Leaving it open
+  // means the following talkTo is swallowed and healing stops working.
+  bot.send({ type: 'endDialogue' });
+  bot.run.healNpc = null;
+  return true;
 }
 
 /** No prey visible: drift so spawns come back into view. */
