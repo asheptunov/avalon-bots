@@ -54,6 +54,9 @@ class FakeBot:
     async def talk_to(self, npc, opt=None):
         self.sent.append({"type": "talkTo", "npcId": npc, "optionId": opt})
 
+    async def use_teleport(self):
+        self.sent.append({"type": "useTeleport"})
+
     move_item = ab.AvalonBot.move_item
     take_item = ab.AvalonBot.take_item
 
@@ -416,6 +419,83 @@ class TestRetreatAndHeal(unittest.TestCase):
         snap = snapshot([me(hp=40)], [rat()])
         run(avalon.make_farm(cfg(until_hp_frac=0.5)), bot, snap)
         self.assertTrue(bot.done)
+
+
+class TestDepth(unittest.TestCase):
+    """Descending to an underground floor and escaping back up.
+
+    The safety property these pin down: every down-hole has a matching
+    up-ladder on the SAME tile, so the way out is always where he landed.
+    """
+
+    HOLE = (58, 22)     # the z=0 hole -> z=-1 (a 'walk' hole)
+
+    def test_surface_hole_has_a_return_ladder_on_the_same_tile(self):
+        import avalon_nav as nav
+        down = next(t for t in nav.teleports(0)
+                    if tuple(t["fromTile"]) == self.HOLE)
+        self.assertEqual(down["toZ"], -1)
+        self.assertEqual(down["mode"], "walk")
+        up = nav.nearest_upward_teleport(-1, self.HOLE)
+        self.assertEqual(tuple(up["fromTile"]), self.HOLE)
+        self.assertEqual(up["toZ"], 0)
+        self.assertEqual(up["mode"], "interact")
+
+    def test_every_underground_floor_has_a_way_up(self):
+        """No floor we can reach may be a one-way trip."""
+        import avalon_nav as nav
+        for z in (-1, -2, -3, -4, -5, -6):
+            self.assertIsNotNone(nav.nearest_upward_teleport(z, (50, 50)),
+                                 f"z={z} has no up-teleport")
+
+    def test_walks_toward_the_named_entry_hole(self):
+        bot = FakeBot(backpack([]))
+        bot.z = 0
+        snap = snapshot([me((50, 30))], [])
+        run(avalon.make_farm(cfg(depth=-1, entry_tile=self.HOLE)), bot, snap)
+        self.assertTrue(bot.of_type("move"))
+        self.assertEqual(bot._farm_state, "DESCEND")
+
+    def test_stops_descending_once_on_target_floor(self):
+        bot = FakeBot(backpack([]))
+        bot.z = -1
+        snap = snapshot([me((58, 22))], [rat((58, 22), mtype="caveBat")])
+        run(avalon.make_farm(cfg(depth=-1, hunt_types=None)), bot, snap)
+        self.assertTrue(bot.of_type("attack"))   # farms, doesn't keep diving
+
+    def test_hurt_underground_climbs_out_instead_of_fleeing_sideways(self):
+        bot = FakeBot(backpack([]))
+        bot.z = -1
+        snap = snapshot([me((58, 22), hp=20)],
+                        [rat((59, 22), mtype="caveBat")])
+        run(avalon.make_farm(cfg(depth=-1)), bot, snap)
+        self.assertEqual(bot._farm_state, "ESCAPE")
+
+    def test_escape_uses_the_ladder_when_standing_on_it(self):
+        bot = FakeBot(backpack([]))
+        bot.z = -1
+        snap = snapshot([me(self.HOLE, hp=20)], [])
+        run(avalon.make_farm(cfg(depth=-1)), bot, snap)
+        self.assertIn("useTeleport", bot.kinds())
+
+    def test_on_the_surface_hurt_still_goes_to_the_healer(self):
+        """Escape is an underground-only behaviour."""
+        aldric = {"id": "n1", "npcType": "healer", "name": "Brother Aldric",
+                  "x": px(20), "y": px(10), "z": 0}
+        bot = FakeBot(backpack([]))
+        bot.z = 0
+        snap = snapshot([me((10, 10), hp=20)], [], npcs=[aldric])
+        run(avalon.make_farm(cfg(depth=-1)), bot, snap)
+        self.assertEqual(bot._farm_state, "RETREAT")
+
+    def test_does_not_descend_while_fleeing(self):
+        """Never dive on the way out of a fight we barely survived."""
+        bot = FakeBot(backpack([]))
+        bot.z = 0
+        snap = snapshot([me((50, 30), hp=20)], [])
+        run(avalon.make_farm(cfg(depth=-1, entry_tile=self.HOLE,
+                                 healer_name=None)), bot, snap)
+        self.assertNotEqual(bot._farm_state, "DESCEND")
 
 
 class TestRoaming(unittest.TestCase):

@@ -166,6 +166,17 @@ def set_nav_obstacles(bot, snap, me):
 def dist_px(ax, ay, bx, by):
     return math.hypot(ax - bx, ay - by)
 
+def _parse_tile(spec):
+    """'58,22' -> (58, 22); None -> None."""
+    if not spec:
+        return None
+    try:
+        xs, ys = spec.split(",", 1)
+        return int(xs), int(ys)
+    except ValueError:
+        sys.exit(f"bad tile {spec!r}; want 'x,y' (e.g. 58,22)")
+
+
 def resolve_target(spec, snap):
     """A target spec -> (x_px, y_px). Accepts 'x,y' tiles, a location name,
     or a player name (resolved against the current snapshot)."""
@@ -740,6 +751,27 @@ TELEPORT_INTERACT_PX = TILE * 1.4
 TELEPORT_TRIGGER_TILES = 2
 
 
+async def take_teleport(bot, me, tp):
+    """Move onto / interact with a teleport marker. Returns True once we've sent
+    the `useTeleport` (or stepped onto a hole), False while still walking there.
+
+    The two modes differ in how you trigger them, which is the whole reason this
+    is shared: a 'walk' hole transitions you the moment you stand on the tile
+    (no message at all), while an 'interact' ladder needs you within ~1.5 tiles
+    and then an explicit useTeleport."""
+    ftx, fty = tp["fromTile"]
+    goal_px = (ftx * TILE, fty * TILE)
+    if tp["mode"] == "walk":
+        await bot.move(*nav_step(bot, me, *goal_px))
+        return False
+    if dist_px(me["x"], me["y"], *goal_px) <= TELEPORT_INTERACT_PX:
+        await bot.move(0, 0)
+        await bot.use_teleport()
+        return True
+    await bot.move(*nav_step(bot, me, *goal_px))
+    return False
+
+
 async def follow_across_floors(bot, me, snap):
     """Follow a leader who has DESCENDED/ASCENDED and thus VANISHED from our
     snapshot (the server only sends entities on our own floor -- we get no signal
@@ -770,18 +802,7 @@ async def follow_across_floors(bot, me, snap):
     if max(abs(ftx - ltile[0]), abs(fty - ltile[1])) > TELEPORT_TRIGGER_TILES:
         return False                    # leader wasn't at a teleport -> don't dive
 
-    goal_px = (ftx * TILE, fty * TILE)
-    d = dist_px(me["x"], me["y"], *goal_px)
-    if tp["mode"] == "walk":
-        # Hole: step onto the tile; the server transitions us automatically.
-        await bot.move(*nav_step(bot, me, *goal_px))
-    else:
-        # Ladder: get within interact range, then send useTeleport.
-        if d <= TELEPORT_INTERACT_PX:
-            await bot.move(0, 0)
-            await bot.use_teleport()
-        else:
-            await bot.move(*nav_step(bot, me, *goal_px))
+    await take_teleport(bot, me, tp)
     if getattr(bot, "_xfloor_note", None) != (z, ftx, fty):
         bot._xfloor_note = (z, ftx, fty)
         print(f"escort {me['name']}: leader vanished at ({ltile[0]},{ltile[1]}) "
@@ -806,15 +827,7 @@ async def home_to_surface(bot, me):
     if not up:
         return False
     ftx, fty = up["fromTile"]
-    goal_px = (ftx * TILE, fty * TILE)
-    if up["mode"] == "walk":
-        await bot.move(*nav_step(bot, me, *goal_px))
-    else:
-        if dist_px(me["x"], me["y"], *goal_px) <= TELEPORT_INTERACT_PX:
-            await bot.move(0, 0)
-            await bot.use_teleport()
-        else:
-            await bot.move(*nav_step(bot, me, *goal_px))
+    await take_teleport(bot, me, up)
     if getattr(bot, "_home_note", None) != (z, ftx, fty):
         bot._home_note = (z, ftx, fty)
         print(f"escort {me['name']}: no leader in sight on z{z} -- homing to "
@@ -1267,7 +1280,7 @@ class FarmConfig:
     def __init__(self, loot=True, eat=True, cook=True, stack=True,
                  hunt_types=None, retreat_frac=0.35, resume_frac=0.85,
                  heal_to_frac=0.95, healer_name=None, roam_px=TILE * 12,
-                 until_hp_frac=None):
+                 until_hp_frac=None, depth=0, entry_tile=None):
         self.loot = loot
         self.eat = eat
         self.cook = cook
@@ -1279,6 +1292,12 @@ class FarmConfig:
         self.healer_name = healer_name
         self.roam_px = roam_px
         self.until_hp_frac = until_hp_frac
+        # Target floor (0 = surface). Negative means go underground, which
+        # changes the danger model: monsters aggro on sight and there's no
+        # healer down there, so `retreat_frac` becomes an escape trigger.
+        self.depth = depth
+        # Which surface hole to descend by, as a (tx,ty) tile; None = nearest.
+        self.entry_tile = entry_tile
 
 
 async def farm_cook_and_stack(bot, cfg):
@@ -1446,6 +1465,55 @@ async def farm_eat_step(bot, me, cfg):
     return True
 
 
+async def farm_descend_step(bot, me, cfg):
+    """Walk to the next hole down and take it, until we're on `cfg.depth`.
+
+    Routes one floor at a time through the known teleport graph rather than
+    trying to plan the whole descent: each floor's down-hole is reachable from
+    where the previous one drops you, and taking them in order is what a player
+    does. Returns True while still travelling (caller should return)."""
+    z = getattr(bot, "z", 0)
+    if z <= cfg.depth:
+        return False
+    tile = (nav._tile(me["x"]), nav._tile(me["y"]))
+    # Prefer the specific hole the user named while we're still on the surface.
+    tp = None
+    if z == 0 and cfg.entry_tile:
+        tp = next((t for t in nav.teleports(0)
+                   if tuple(t["fromTile"]) == cfg.entry_tile), None)
+    if tp is None:
+        tp = nav.nearest_teleport(z, z - 1, tile)
+    if tp is None:
+        if not getattr(bot, "_farm_no_way_down", False):
+            bot._farm_no_way_down = True
+            print(f"!! no way down from z{z} -- farming here instead")
+        return False
+    farm_log(bot, "DESCEND",
+             lambda: f"z{z} -> z{z-1} via {tp['mode']} @{tuple(tp['fromTile'])}")
+    await take_teleport(bot, me, tp)
+    return True
+
+
+async def farm_escape_step(bot, me):
+    """Flee UP one floor: the way out is an 'interact' ladder, and on every
+    underground floor the up-ladder sits on the same tile as the hole we came
+    down -- so the exit is always exactly where we landed.
+
+    Returns True while still escaping (caller should return)."""
+    z = getattr(bot, "z", 0)
+    if z >= 0:
+        return False
+    tile = (nav._tile(me["x"]), nav._tile(me["y"]))
+    up = nav.nearest_upward_teleport(z, tile)
+    if not up:
+        return False
+    farm_log(bot, "ESCAPE",
+             lambda: f"hurt on z{z} -- climbing to z{up['toZ']} "
+                     f"@{tuple(up['fromTile'])}")
+    await take_teleport(bot, me, up)
+    return True
+
+
 def retreat_step(bot, me, snap, cfg):
     """Back away toward safety. If we know a healer, retreat TO them (they're a
     safe spot and the heal is there); otherwise just put distance between us and
@@ -1508,6 +1576,10 @@ def make_farm(cfg):
             # Eating first: regen is the actual healing mechanism, and it works
             # while we walk. Then back off and let it tick.
             await farm_eat_step(bot, me, cfg)
+            # Underground there is no healer and monsters aggro on sight, so the
+            # only real safety is the surface: climb out BEFORE trying to heal.
+            if await farm_escape_step(bot, me):
+                return
             (dx, dy), healer = retreat_step(bot, me, snap, cfg)
             at_healer = bool(healer) and (dx, dy) == (0, 0)
             farm_log(bot, "RETREAT",
@@ -1516,6 +1588,12 @@ def make_farm(cfg):
             await bot.move(dx, dy)
             if at_healer:
                 await farm_heal_at(bot, me, healer, cfg)
+            return
+
+        # --- travel to the target floor ---------------------------------
+        # Only when healthy: full HP is the price of admission for going down,
+        # so we never descend on the way out of a fight we just barely survived.
+        if cfg.depth < 0 and await farm_descend_step(bot, me, cfg):
             return
 
         # --- fight ------------------------------------------------------
@@ -1674,6 +1752,8 @@ def build_intent(args):
             roam_px=args.roam * TILE,
             until_hp_frac=(args.until_hp / 100.0
                            if args.until_hp is not None else None),
+            depth=args.depth,
+            entry_tile=_parse_tile(args.entry),
         )
         # Reuse `heal`'s option picker, in repeating mode: farming heals many
         # times over a long run, so a heal must not end the job.
@@ -1907,6 +1987,13 @@ def main():
                     help="don't cook raw meat into cooked")
     fa.add_argument("--no-stack", action="store_true",
                     help="don't merge split stacks in the backpack")
+    fa.add_argument("--depth", type=int, default=0, metavar="Z",
+                    help="floor to farm on: 0 = surface (default), negative "
+                         "goes underground (e.g. -1). Descends via the known "
+                         "holes and climbs back out the ladders when hurt.")
+    fa.add_argument("--entry", default=None, metavar="X,Y",
+                    help="which surface hole to descend by, as a tile "
+                         "(e.g. 58,22); default picks the nearest")
 
     f = sub.add_parser("follow", help="follow a player until Ctrl-C")
     f.add_argument("target")
