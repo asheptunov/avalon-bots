@@ -768,6 +768,7 @@ class AvalonBot {
 // happens in PIXELS. `pathStep` closes that gap with centre steering and
 // `safeStep`; without them a valid tile-by-tile plan can still emit a step that
 // clips a wall corner and nets zero movement.
+
 let MAPS = null;
 let MAP_BUNDLE = null;
 
