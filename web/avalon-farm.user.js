@@ -1763,6 +1763,7 @@ function makeFarm(cfg, log) {
 // we must not collide with its styles or swallow its input. Everything the
 // Python CLI took as a flag (--hunt, --retreat-hp, --resume-hp, --loot, ...)
 // shows up here, plus a live status readout and a log tail.
+
 const CSS = `
 :host { all: initial; }
 .panel {
@@ -1908,6 +1909,12 @@ function createPanel({ onStart, onStop }) {
 // on every snapshot. Here the server's 100 ms tick IS our clock -- we run the
 // intent on each decoded snapshot, so the bot ticks at exactly the rate the
 // server updates and never busy-waits.
+
+
+
+
+
+
 // EMBEDDED_MAPS is injected by build.py from avalon_maps.json -- a fallback
 // only; the maps we actually use are extracted from the running client.
 /* global EMBEDDED_MAPS */
