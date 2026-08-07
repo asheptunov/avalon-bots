@@ -2000,6 +2000,9 @@ def main():
     p.add_argument("--password")
     p.add_argument("--account", help="account username to log into (creds.json array)")
     p.add_argument("--character", help="character name (default: first on the account)")
+    p.add_argument("--no-map-check", action="store_true",
+                   help="skip the check for an updated client bundle "
+                        "(offline use; risks stale collision maps)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("where", help="print positions of everyone visible and exit")
@@ -2128,6 +2131,14 @@ def main():
     s.add_argument("json")
 
     args = p.parse_args()
+
+    # The surface collision map is generated from the client bundle, so a game
+    # update silently invalidates it and bots start pinning on obstacles the map
+    # says are open. The browser never has this problem because it always loads
+    # the current bundle -- so we check for a new one on every run.
+    if not args.no_map_check:
+        nav.refresh_maps_if_stale()
+
     accounts = load_accounts(args)
 
     # The swarm launcher is a pure orchestrator: it spawns child avalon.py

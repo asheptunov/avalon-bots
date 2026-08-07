@@ -12,10 +12,12 @@ diagonals), so we path on an 8-connected grid.
 import heapq
 import json
 import os
+import sys
 
 TILE = 32
 HERE = os.path.dirname(os.path.abspath(__file__))
 _MAPS = None
+_MAP_BUNDLE = None      # which client bundle _MAPS was extracted from
 
 
 def load_maps(path=None):
@@ -28,11 +30,60 @@ def load_maps(path=None):
     if not os.path.exists(path):
         return _MAPS                     # no maps -> callers fall back to greedy
     raw = json.load(open(path, encoding="utf-8"))
+    global _MAP_BUNDLE
+    _MAP_BUNDLE = raw.get("bundle")
     for zk, zn in raw.items():
+        if zk == "bundle":               # version stamp, not a zone
+            continue
         _MAPS[int(zk)] = {
             "w": zn["widthTiles"], "h": zn["heightTiles"], "rows": zn["rows"],
             "teleports": zn.get("teleports", [])}
     return _MAPS
+
+
+def map_bundle():
+    """Which client bundle the loaded maps were extracted from (or None for
+    maps predating the stamp)."""
+    load_maps()
+    return _MAP_BUNDLE
+
+
+def refresh_maps_if_stale(quiet=False):
+    """Re-extract the collision maps if the game has shipped a new client.
+
+    The surface map is GENERATED from the bundle (the server never sends
+    terrain), so a redeploy silently invalidates it -- trees and water move, and
+    bots then path straight into walls the map thinks are open. The browser is
+    immune because it always loads the current bundle; this gives us the same
+    property.
+
+    Returns True if maps were refreshed. Never fatal: on any failure we keep
+    running with what we have."""
+    global _MAPS, _MAP_BUNDLE
+    try:
+        import extract_maps
+        live = extract_maps.live_bundle_path()
+    except Exception as e:
+        if not quiet:
+            print(f"nav: could not check for a client update ({e}); "
+                  "using existing maps", file=sys.stderr)
+        return False
+    if live == map_bundle():
+        return False
+    if not quiet:
+        print(f"nav: client updated ({map_bundle()} -> {live}) -- "
+              "re-extracting collision maps", file=sys.stderr)
+    try:
+        extract_maps.main()
+    except SystemExit:
+        pass
+    except Exception as e:
+        print(f"nav: map refresh FAILED ({e}); continuing with stale maps -- "
+              "expect bots to pin on obstacles", file=sys.stderr)
+        return False
+    _MAPS, _MAP_BUNDLE = None, None      # drop the cache so the new maps load
+    load_maps()
+    return True
 
 
 def have_map(z):

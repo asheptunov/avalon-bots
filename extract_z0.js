@@ -19,7 +19,14 @@ const js = fs.readFileSync(bundlePath, "utf8");
 
 // --- locate the DOM-free worldgen slice -------------------------------------
 // Slice starts after the bootstrap IIFE `(function(){...})();` that follows the
-// pixi import, and ends after the `ko[xn(e)]=Fh(e)` zone-grid init loop.
+// pixi import, and ends after the zone-grid init loop.
+//
+// The minifier renames every symbol on each rebuild (the loop was
+// `ko[xn(e)]=Fh(e)` in one build and `Ys[gn(e)]=Zf(e)` in the next), so we match
+// the loop by its STRUCTURE and read the current names out of it. Matching on
+// literal names meant a silent break the next time the game shipped: extraction
+// failed, the committed map went stale, and bots walked into trees the map said
+// were empty.
 const importEnd = js.indexOf(";", js.indexOf('from"./pixi')) + 1;
 // Walk the bootstrap IIFE parens to find its end.
 let i = js.indexOf("(function(){", importEnd), depth = 0, sliceStart = -1;
@@ -27,12 +34,16 @@ for (let j = i; j < js.length; j++) {
   if (js[j] === "(") depth++;
   else if (js[j] === ")") { if (--depth === 0) { sliceStart = js.indexOf(";", j) + 1; break; } }
 }
-const koInit = js.indexOf("const Gh=8,xn=e=>e+Gh,ko=[]");
-const sliceEnd = js.indexOf("Fh(e);", koInit) + "Fh(e);".length;
-if (sliceStart < 0 || koInit < 0 || sliceEnd < 0) {
-  console.error("could not locate worldgen slice boundaries; bundle layout changed");
+
+// `const <OFF>=8,<IDX>=e=>e+<OFF>,<ZONES>=[];for(const e of[0,...])<ZONES>[<IDX>(e)]=<ASSEMBLE>(e);`
+const initRe = /const ([A-Za-z$_][\w$]*)=8,([A-Za-z$_][\w$]*)=e=>e\+\1,([A-Za-z$_][\w$]*)=\[\];for\(const e of\[[^\]]*\]\)\3\[\2\(e\)\]=([A-Za-z$_][\w$]*)\(e\);/;
+const m = initRe.exec(js);
+if (sliceStart < 0 || !m) {
+  console.error("could not locate the worldgen zone-init loop; bundle layout changed");
   process.exit(3);
 }
+const assemble = m[4];              // the zone-grid assembler, e.g. `Zf`
+const sliceEnd = m.index + m[0].length;
 const slice = js.slice(sliceStart, sliceEnd);
 
 // --- stub the (unused) pixi import names so references don't ReferenceError --
@@ -40,14 +51,14 @@ const importDecl = js.slice(0, importEnd);
 const pixiNames = [...importDecl.matchAll(/ as ([A-Za-z$_][A-Za-z0-9$_]*)/g)].map(m => m[1]);
 const stubs = pixiNames.map(n => `var ${n}=function(){};`).join("");
 
-// --- run the slice, then dump Fh(0) -----------------------------------------
-// `Fh` and `au` are `function`/`const` declarations in the slice scope, so we
-// evaluate everything in one function body and read them out at the end.
+// --- run the slice, then dump <assemble>(0) ---------------------------------
+// The assembler is a `function`/`const` declaration in the slice scope, so we
+// evaluate everything in one function body and read it out at the end.
 const program = `
 "use strict";
 ${stubs}
 ${slice}
-;globalThis.__grid = Fh(0);
+;globalThis.__grid = ${assemble}(0);
 `;
 
 let grid;

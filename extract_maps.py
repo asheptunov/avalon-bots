@@ -28,14 +28,21 @@ def fetch(url):
         return r.read().decode("utf-8", "replace")
 
 
-def get_bundle_text(arg):
-    if arg and os.path.exists(arg):
-        return open(arg, encoding="utf-8", errors="replace").read()
+def live_bundle_path():
+    """The bundle path index.html currently points at, e.g.
+    '/assets/index-B5ZZen4-.js'. The filename hash changes on every deploy, so
+    it doubles as a version stamp for the maps we extract from it."""
     idx = fetch(INDEX_URL)
     m = re.search(r'src="(/assets/index-[^"]+\.js)"', idx)
     if not m:
-        sys.exit("could not find main JS bundle in index.html")
-    return fetch(INDEX_URL.rstrip("/") + m.group(1))
+        raise RuntimeError("could not find main JS bundle in index.html")
+    return m.group(1)
+
+
+def get_bundle_text(arg):
+    if arg and os.path.exists(arg):
+        return open(arg, encoding="utf-8", errors="replace").read()
+    return fetch(INDEX_URL.rstrip("/") + live_bundle_path())
 
 
 def match_bracket(s, open_at, opener="[", closer="]"):
@@ -174,8 +181,17 @@ def main():
                     "heightTiles": z0["heightTiles"], "rows": z0["rows"],
                     "teleports": z0_tp}
 
+    # Stamp which bundle these maps came from. The filename hash changes on
+    # every deploy, so this is what lets the bot notice its maps are stale
+    # instead of silently pathing through a tree that moved.
+    try:
+        zones["bundle"] = src if (src and os.path.exists(src)) else live_bundle_path()
+    except Exception as e:                     # offline: keep the maps usable
+        print(f"  warn: could not stamp bundle version: {e}", file=sys.stderr)
+
     with open(out, "w", encoding="utf-8") as f:
         json.dump(zones, f)
+    zones.pop("bundle", None)
     for z in sorted(zones, key=int):
         zn = zones[z]
         blocked = sum(row.count("#") for row in zn["rows"])
