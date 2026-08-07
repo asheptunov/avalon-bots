@@ -1345,12 +1345,12 @@ def _stackable(item_id, group):
     return any(it.get("quantity", 1) > 1 for _, it in group)
 
 
-async def farm_loot_step(bot, snap, me, cfg):
+async def farm_loot_step(bot, snap, me):
     """Walk to the nearest lootable drop and take it. Returns True if we're busy
     looting (caller should not also try to fight this tick)."""
-    items = lootable_items(bot, snap)
-    if not items:
-        bot._farm_loot_target = None
+    target = nearest_loot(bot, snap, me)
+    if not target:
+        bot._farm_chase = None
         return False
 
     free, cap = bot.pack_space()
@@ -1363,16 +1363,20 @@ async def farm_loot_step(bot, snap, me, cfg):
         return False
     bot._farm_warned_full = False
 
-    target = items[0]
     # Track how long we've chased this one so an unreachable drop can't stall
     # the loop forever.
-    prev = getattr(bot, "_farm_loot_target", None)
-    if prev != target["id"]:
-        bot._farm_loot_target = target["id"]
-        bot._farm_loot_since = _now()
-    elif _now() - getattr(bot, "_farm_loot_since", 0.0) > LOOT_TIMEOUT_S:
-        bot._farm_loot_skip = getattr(bot, "_farm_loot_skip", set()) | {target["id"]}
-        bot._farm_loot_target = None
+    chased, since = getattr(bot, "_farm_chase", None) or (None, 0.0)
+    if chased != target["id"]:
+        bot._farm_chase = (target["id"], _now())
+    elif _now() - since > LOOT_TIMEOUT_S:
+        # Ban it, but keep the ban list bounded to ids still on the floor --
+        # otherwise a multi-hour run accumulates thousands of despawned ids and
+        # tests every one of them, every tick.
+        on_floor = {g["id"] for g in (snap.get("groundItems") or [])}
+        skip = getattr(bot, "_farm_loot_skip", set()) & on_floor
+        skip.add(target["id"])
+        bot._farm_loot_skip = skip
+        bot._farm_chase = None
         print(f"  giving up on {target['item']['itemId']} (unreachable)")
         return False
 
@@ -1480,11 +1484,12 @@ def make_farm(cfg):
             # while we walk. Then back off and let it tick.
             await farm_eat_step(bot, me, cfg)
             (dx, dy), healer = retreat_step(bot, me, snap, cfg)
-            farm_log(bot, f"RETREAT hp={me['hp']}/{me['maxHp']} "
-                          f"({frac*100:.0f}%)"
-                          + (" at healer" if healer and (dx, dy) == (0, 0) else ""))
+            at_healer = bool(healer) and (dx, dy) == (0, 0)
+            farm_log(bot, "RETREAT",
+                     lambda: f"hp={me['hp']}/{me['maxHp']} ({frac*100:.0f}%)"
+                             + (" at healer" if at_healer else ""))
             await bot.move(dx, dy)
-            if healer and (dx, dy) == (0, 0):
+            if at_healer:
                 await farm_heal_at(bot, me, healer, cfg)
             return
 
@@ -1507,7 +1512,7 @@ def make_farm(cfg):
             return
 
         # --- nothing to fight: loot, then keep house --------------------
-        if cfg.loot and await farm_loot_step(bot, snap, me, cfg):
+        if cfg.loot and await farm_loot_step(bot, snap, me):
             farm_log(bot, "LOOT")
             return
 
@@ -1519,7 +1524,7 @@ def make_farm(cfg):
 
         # Idle: no prey in sight. Roam so we find the next spawn instead of
         # standing on an empty field forever.
-        await farm_roam_step(bot, me, snap, cfg)
+        await farm_roam_step(bot, me, cfg)
     return intent
 
 
@@ -1539,7 +1544,7 @@ async def farm_heal_at(bot, me, healer, cfg):
         await bot.talk_to(healer["id"])
 
 
-async def farm_roam_step(bot, me, snap, cfg):
+async def farm_roam_step(bot, me, cfg):
     """No prey visible: drift to a new spot so spawns come back into view.
 
     Picks a wander target, walks it, and re-picks on arrival or timeout. Without

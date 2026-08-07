@@ -35,7 +35,6 @@ class FakeBot:
     iter_items = ab.AvalonBot.iter_items
     find_item = ab.AvalonBot.find_item
     count_item = ab.AvalonBot.count_item
-    items_by_id = ab.AvalonBot.items_by_id
     backpack = ab.AvalonBot.backpack
     pack_space = ab.AvalonBot.pack_space
     has_status = ab.AvalonBot.has_status
@@ -257,13 +256,13 @@ class TestEating(unittest.TestCase):
         """Healthy: burn the short apple, keep the long-lasting sushi."""
         bot = FakeBot(backpack([item("fish", 1, "f1"), item("apple", 1, "a1")]),
                       self.HUNGRY)
-        self.assertEqual(avalon.pick_food(bot, emergency=False), "apple")
+        self.assertEqual(avalon.pick_food(bot, emergency=False)["itemId"], "apple")
 
     def test_emergency_takes_the_longest_lasting_food(self):
         """Hurt: eat the sushi so we don't break off to eat again mid-retreat."""
         bot = FakeBot(backpack([item("fish", 1, "f1"), item("apple", 1, "a1")]),
                       self.HUNGRY)
-        self.assertEqual(avalon.pick_food(bot, emergency=True), "fish")
+        self.assertEqual(avalon.pick_food(bot, emergency=True)["itemId"], "fish")
 
     def test_warns_when_out_of_food(self):
         bot = FakeBot(backpack([]), self.HUNGRY)
@@ -335,13 +334,21 @@ class TestRetreatAndHeal(unittest.TestCase):
     def test_heal_dialogue_does_not_end_the_farm(self):
         """`heal` is one-shot; farming must survive its own heals."""
         bot = FakeBot(backpack([]))
-        bot.heal_once = False
         bot._heal_npc = "n1"
-        asyncio.run(avalon.heal_on_event(bot, {
-            "type": "dialogue", "npcId": "n1",
-            "options": [{"id": "o1", "label": "Heal me"}]}))
+        dialogue = {"type": "dialogue", "npcId": "n1",
+                    "options": [{"id": "o1", "label": "Heal me"}]}
+        asyncio.run(avalon.make_heal_on_event(one_shot=False)(bot, dialogue))
         self.assertFalse(bot.done)
         self.assertIn("endDialogue", bot.kinds())
+
+    def test_heal_command_still_exits_after_healing(self):
+        """The one-shot default must not regress now that farm shares this."""
+        bot = FakeBot(backpack([]))
+        bot._heal_npc = "n1"
+        dialogue = {"type": "dialogue", "npcId": "n1",
+                    "options": [{"id": "o1", "label": "Heal me"}]}
+        asyncio.run(avalon.make_heal_on_event()(bot, dialogue))
+        self.assertTrue(bot.done)
 
     def test_until_hp_still_stops(self):
         bot = FakeBot(backpack([]))

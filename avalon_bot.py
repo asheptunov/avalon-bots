@@ -333,11 +333,6 @@ class AvalonBot:
         return sum(it.get("quantity", 0) for it in self.iter_items()
                    if it.get("itemId") == item_id)
 
-    def items_by_id(self, item_id):
-        """Every held stack of one itemId -- several exist when loot arrives as
-        separate stacks that the server didn't merge (what `stack` fixes)."""
-        return [it for it in self.iter_items() if it.get("itemId") == item_id]
-
     def backpack(self):
         """The equipped backpack (the only container we loot into), or None.
 
