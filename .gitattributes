@@ -1,0 +1,15 @@
+# The userscript is a build artifact that CI rebuilds and byte-compares against
+# the committed copy. That comparison only means anything if the build is
+# reproducible, and it is not reproducible while line endings depend on which OS
+# checked the sources out: a Windows checkout with core.autocrlf=true hands
+# build.mjs CRLF sources and it embeds those carriage returns in the bundle,
+# while Linux CI reads LF and produces a different file from the same commit.
+#
+# Normalizing to LF in the working tree -- not just in the index -- is what makes
+# `node build.mjs` produce identical bytes everywhere.
+* text=auto eol=lf
+
+# Binary-ish and generated content that must never be touched.
+*.png binary
+*.jpg binary
+*.ico binary
