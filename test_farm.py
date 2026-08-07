@@ -343,9 +343,13 @@ class TestEating(unittest.TestCase):
 
 
 class TestRetreatAndHeal(unittest.TestCase):
+    # NB: these place the monster well away from the player. A monster in melee
+    # deliberately overrides the retreat (see can_disengage) -- fleeing from
+    # something already swinging just feeds it free hits.
+
     def test_retreats_below_threshold(self):
         bot = FakeBot(backpack([]))
-        snap = snapshot([me((10, 10), hp=20)], [rat((10, 10))])
+        snap = snapshot([me((10, 10), hp=20)], [rat((25, 10))])
         run(avalon.make_farm(cfg()), bot, snap)
         self.assertTrue(bot.fleeing)
         self.assertFalse(bot.of_type("attack"))
@@ -354,10 +358,10 @@ class TestRetreatAndHeal(unittest.TestCase):
         """Above retreat but below resume: must NOT re-engage yet."""
         bot = FakeBot(backpack([]))
         intent = avalon.make_farm(cfg())
-        run(intent, bot, snapshot([me(hp=20)], [rat((10, 10))]))
+        run(intent, bot, snapshot([me((10, 10), hp=20)], [rat((25, 10))]))
         self.assertTrue(bot.fleeing)
         bot.sent.clear()
-        run(intent, bot, snapshot([me(hp=60)], [rat((10, 10))]))
+        run(intent, bot, snapshot([me((10, 10), hp=60)], [rat((25, 10))]))
         self.assertTrue(bot.fleeing)
         self.assertFalse(bot.of_type("attack"))
 
@@ -374,7 +378,7 @@ class TestRetreatAndHeal(unittest.TestCase):
         aldric = {"id": "n1", "npcType": "healer", "name": "Brother Aldric",
                   "x": px(20), "y": px(10), "z": 0}
         bot = FakeBot(backpack([]))
-        snap = snapshot([me((10, 10), hp=20)], [rat((11, 10))], npcs=[aldric])
+        snap = snapshot([me((10, 10), hp=20)], [rat((2, 10))], npcs=[aldric])
         run(avalon.make_farm(cfg()), bot, snap)
         mv = bot.of_type("move")[-1]
         self.assertEqual(mv["dx"], 1)   # toward Aldric (east), not away
@@ -419,6 +423,74 @@ class TestRetreatAndHeal(unittest.TestCase):
         snap = snapshot([me(hp=40)], [rat()])
         run(avalon.make_farm(cfg(until_hp_frac=0.5)), bot, snap)
         self.assertTrue(bot.done)
+
+
+class TestLiveRunRegressions(unittest.TestCase):
+    """Three bugs that together killed Sam on the first live run: he starved
+    with a bag of apples, fled from a rat that hits for 1, and never looted."""
+
+    HUNGRY = {"statusEffects": []}
+
+    def test_eats_while_fighting(self):
+        """The killer bug: eating sat in the idle branch, but the rat field
+        always has a rat in view, so the fight branch returned first and he
+        never ate -- and without wellFed, HP never regenerates."""
+        bot = FakeBot(backpack([item("apple", 7, "a1")]), self.HUNGRY)
+        snap = snapshot([me((10, 10))], [rat((10, 10))])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertTrue([m for m in bot.of_type("useItem")
+                         if m["instanceId"] == "a1"], "should eat mid-fight")
+        self.assertTrue(bot.of_type("attack"), "and still fight")
+
+    def test_eats_while_chasing(self):
+        bot = FakeBot(backpack([item("apple", 7, "a1")]), self.HUNGRY)
+        snap = snapshot([me((10, 10))], [rat((16, 10))])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertTrue(bot.of_type("useItem"))
+
+    def test_cornered_bot_fights_instead_of_feeding_free_hits(self):
+        """Hurt with a rat in melee: fleeing just eats free hits, so fight."""
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10), hp=20)], [rat((10, 10))])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertTrue(bot.of_type("attack"))
+
+    def test_still_retreats_when_it_can_actually_break_away(self):
+        """Hurt with nothing adjacent: retreating is genuinely safe."""
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10), hp=20)], [rat((25, 10))])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertFalse(bot.of_type("attack"))
+        self.assertEqual(bot._farm_state, "RETREAT")
+
+    def test_loots_nearby_corpse_before_chasing_the_next_rat(self):
+        """He left every corpse behind because loot sat behind the fight
+        branch and there was always another rat to chase."""
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))],
+                        [rat((20, 10))],          # next rat, 10 tiles away
+                        ground=[corpse((10, 10),
+                                       contents=[item("gold", 3, "l1")])])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertEqual(bot.of_type("moveItem")[0]["instanceId"], "l1")
+
+    def test_melee_target_still_beats_looting(self):
+        """Don't stop mid-swing to pick things up."""
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [rat((10, 10))],
+                        ground=[corpse((10, 10),
+                                       contents=[item("gold", 3, "l1")])])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertTrue(bot.of_type("attack"))
+        self.assertFalse(bot.of_type("moveItem"))
+
+    def test_distant_loot_does_not_distract_from_a_close_monster(self):
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [rat((12, 10))],
+                        ground=[corpse((40, 40),
+                                       contents=[item("gold", 3, "l1")])])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertFalse(bot.of_type("moveItem"))
 
 
 class TestDepth(unittest.TestCase):

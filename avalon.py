@@ -1249,6 +1249,14 @@ def nearest_loot(bot, snap, me):
                                             me["x"], me["y"]))
 
 
+def near_loot(bot, snap, me, within_px):
+    """True if there's takeable loot within `within_px` -- i.e. worth grabbing
+    now rather than chasing the next monster past it."""
+    found = nearest_loot(bot, snap, me)
+    return bool(found) and dist_px(found[0]["x"], found[0]["y"],
+                                   me["x"], me["y"]) <= within_px
+
+
 def pick_food(bot, emergency=False):
     """Choose what to eat, returning the held item (or None).
 
@@ -1280,7 +1288,8 @@ class FarmConfig:
     def __init__(self, loot=True, eat=True, cook=True, stack=True,
                  hunt_types=None, retreat_frac=0.35, resume_frac=0.85,
                  heal_to_frac=0.95, healer_name=None, roam_px=TILE * 12,
-                 until_hp_frac=None, depth=0, entry_tile=None):
+                 until_hp_frac=None, depth=0, entry_tile=None,
+                 loot_px=TILE * 8):
         self.loot = loot
         self.eat = eat
         self.cook = cook
@@ -1292,6 +1301,9 @@ class FarmConfig:
         self.healer_name = healer_name
         self.roam_px = roam_px
         self.until_hp_frac = until_hp_frac
+        # Loot this close is collected before chasing the next monster; farther
+        # drops wait until nothing is worth fighting.
+        self.loot_px = loot_px
         # Target floor (0 = surface). Negative means go underground, which
         # changes the danger model: monsters aggro on sight and there's no
         # healer down there, so `retreat_frac` becomes an escape trigger.
@@ -1494,6 +1506,23 @@ async def farm_descend_step(bot, me, cfg):
     return True
 
 
+def can_disengage(me, snap, engaged_px=TILE * 3):
+    """True if backing off would actually get us out of trouble.
+
+    Running from something already swinging at you is strictly worse than
+    killing it: you eat free hits, deal none, and regen is suppressed in combat
+    anyway. So we only retreat when nothing is currently on top of us -- if a
+    monster IS in our face, finishing it is the safer play, and the flee
+    threshold applies only to *starting* new fights.
+
+    This is what killed Sam on the first live run: at 23% HP he walked away from
+    a rat that hits for 1, taking a free hit every tick for 20 tiles until he
+    died with a bag full of unused apples."""
+    return not any(m["hp"] > 0
+                   and dist_px(m["x"], m["y"], me["x"], me["y"]) <= engaged_px
+                   for m in snap["monsters"])
+
+
 async def farm_escape_step(bot, me):
     """Flee UP one floor: the way out is an 'interact' ladder, and on every
     underground floor the up-ladder sits on the same tile as the hole we came
@@ -1566,6 +1595,15 @@ def make_farm(cfg):
             bot.done = True
             return
 
+        # --- upkeep: eat FIRST, in every state --------------------------
+        # Eating is not an idle-time luxury: `wellFed` is the only thing that
+        # makes HP regenerate, so it has to happen while fighting too. (This
+        # sat in the idle branch and never ran -- on a field that always has a
+        # rat in view the fight branch returned first, so he starved and then
+        # bled out with a full bag of apples.) It's throttled and costs one
+        # message, so running it every tick is cheap.
+        await farm_eat_step(bot, me, cfg)
+
         # --- retreat / resume hysteresis --------------------------------
         if frac <= cfg.retreat_frac:
             bot.fleeing = True
@@ -1573,13 +1611,18 @@ def make_farm(cfg):
             bot.fleeing = False
 
         if bot.fleeing:
-            # Eating first: regen is the actual healing mechanism, and it works
-            # while we walk. Then back off and let it tick.
-            await farm_eat_step(bot, me, cfg)
-            # Underground there is no healer and monsters aggro on sight, so the
-            # only real safety is the surface: climb out BEFORE trying to heal.
+            # Underground the ladder is a real exit -- taking it ends the fight
+            # outright -- so it beats the can_disengage rule below: climb out
+            # even with a bat on us, rather than trading blows on a floor with
+            # no healer and more spawns inbound.
             if await farm_escape_step(bot, me):
                 return
+
+        # On the surface, fleeing only helps if we can actually break away; with
+        # something in our face, killing it is safer than feeding it free hits
+        # (see can_disengage). So a cornered bot drops through to the fight
+        # branch instead of being chased down.
+        if bot.fleeing and can_disengage(me, snap):
             (dx, dy), healer = retreat_step(bot, me, snap, cfg)
             at_healer = bool(healer) and (dx, dy) == (0, 0)
             farm_log(bot, "RETREAT",
@@ -1596,8 +1639,19 @@ def make_farm(cfg):
         if cfg.depth < 0 and await farm_descend_step(bot, me, cfg):
             return
 
-        # --- fight ------------------------------------------------------
+        # --- grab loot at our feet before moving on ----------------------
+        # Loot used to sit behind the fight branch, so on a field that always
+        # has another rat in view he never stopped to collect and left every
+        # corpse behind. Drops close enough to take now win over a monster we'd
+        # have to walk to; a monster already in melee still comes first.
         m = nearest_huntable(snap, me, cfg.hunt_types)
+        engaged = m and dist_px(m["x"], m["y"], me["x"], me["y"]) < ab.MELEE_RANGE_PX
+        if cfg.loot and not engaged and near_loot(bot, snap, me, cfg.loot_px):
+            if await farm_loot_step(bot, snap, me):
+                farm_log(bot, "LOOT")
+                return
+
+        # --- fight ------------------------------------------------------
         if m:
             d = dist_px(m["x"], m["y"], me["x"], me["y"])
             if d < ab.MELEE_RANGE_PX:
