@@ -95,6 +95,63 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
 
 ---
 
+## Solo farming (`farm`) — kill / loot / cook / eat / heal
+
+`python avalon.py --account sam_altman farm` now runs **indefinitely**: it kills,
+sweeps up the drops, cooks and stacks what it picks up, eats to keep HP
+regenerating, and retreats to Aldric to heal when hurt. Unit-tested (37 tests in
+`test_farm.py`); **not yet live-smoke-tested**.
+
+State machine (hysteretic, so it can't oscillate at a threshold):
+
+| state | when | what it does |
+|---|---|---|
+| RETREAT | hp ≤ `--retreat-hp` (35%) | eat, fall back to the healer, potion/dialogue heal |
+| FIGHT | prey visible | chase + melee the nearest `--hunt` type |
+| LOOT | no prey | walk to the nearest allowed drop, `moveItem` it into the backpack |
+| — | nothing to do | cook raw meat, merge split stacks, eat if hungry |
+| ROAM | idle | wander `--roam` tiles so new spawns come into view |
+
+Resumes fighting only above `--resume-hp` (85%), not at the retreat line.
+
+### Mechanics learned from the bundle (load-bearing)
+
+- **HP regen requires the `wellFed` status.** The tooltip is explicit: *"Health
+  only regenerates while you are fed."* An unfed bot never heals between fights
+  and death-spirals — this is why `farm` eats, and why `--no-eat` is a footgun.
+  Statuses arrive on `welcome`/`playerStats` as
+  `stats.statusEffects[{kind,remainingMs}]` → `AvalonBot.has_status()`.
+- **Looting is `moveItem`, not a `pickup` verb.** Send
+  `{type:"moveItem", instanceId:<the ITEM's instanceId>, to:{kind:"container",
+  containerInstanceId:<backpack>}}`. The client maps groundItem.id →
+  item.instanceId; we already decode `groundItems[].item.instanceId` directly.
+- **Ground items are only re-sent when `groundRev` changes** — `groundItems:
+  None` means *unchanged*, NOT *empty floor*. `AvalonBot.run` now carries the
+  last list forward (`bot.ground_items`); without this any loot logic sees a
+  bare floor on ~99% of ticks. This bit us and is easy to reintroduce.
+- **Carry limit is SLOTS, not weight.** Items have `oz` weights (`Mg` in the
+  bundle) but there is no capacity cap; a container has a fixed-length
+  `contents` array whose `None`s are the free slots → `pack_space()`.
+  Merging split stacks is what actually frees space, hence `--no-stack`'s
+  warning.
+- **Cooking**: `rawMeat` → `cookedMeat` by `useItem` on it (server-side, near a
+  fire). Worth it — `wellFed` duration is 180s raw vs **480s** cooked (`Xg`).
+- **Food choice**: any food restores regen equally; only the wellFed *duration*
+  differs. So we eat the shortest-lasting food normally (saving the good stuff)
+  and the longest-lasting one in an emergency (so we don't stop to eat again
+  mid-retreat).
+- **Loot ownership**: fresh drops carry `ownerId`/`ownerExpiresAt` reserving them
+  for whoever earned the kill; we skip other people's rather than eat a refusal.
+
+Flags: `--hunt`, `--retreat-hp`, `--resume-hp`, `--heal-to`, `--healer`,
+`--roam`, `--until-hp`, `--no-loot`, `--no-eat`, `--no-cook`, `--no-stack`.
+
+It **reports when the backpack fills** (`!! BACKPACK FULL`) and keeps farming
+without looting, and warns on `!! OUT OF FOOD` since that silently disables
+regen.
+
+---
+
 ## Architecture
 
 - **Independent processes, no comms.** Each bot runs the same rules over its own
@@ -203,6 +260,11 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
 
 Next up:
 
+- **Live-smoke-test `farm`** — the whole loop is unit-tested but has never run
+  against the server. Watch for: does `moveItem` from the ground actually pick
+  up (the one protocol guess we can't verify offline), does `useItem` on rawMeat
+  cook rather than eat it, and does the healer dialogue re-open cleanly on the
+  second retreat.
 - **Live-validate the `enraged` assumption** (see KEY LIVE ASSUMPTION above) —
   the single most load-bearing unknown. Everything follow/defend depends on it.
 - **Live smoke-test the reworked hive** — `swarm --follow "<my char>"` with mixed
