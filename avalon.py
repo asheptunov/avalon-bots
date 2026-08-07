@@ -1196,21 +1196,44 @@ LOOT_REACH_PX = TILE * 1.2
 LOOT_TIMEOUT_S = 6.0
 
 
-def nearest_loot(bot, snap, me):
-    """The nearest ground item we're allowed to take, or None.
+# Ground containers that hold loot rather than being loot: a killed monster
+# leaves a `corpse` (and a dead player a `playerBody`) whose `contents` are the
+# actual drops. They weigh 0, equip nowhere, and taking the container itself
+# does nothing -- you must take the items OUT of it.
+LOOT_CONTAINERS = {"corpse", "playerBody"}
+
+
+def loot_candidates(bot, snap):
+    """Every takeable thing on the floor, as (ground_entry, item_to_take).
+
+    Two shapes exist and this is the whole reason looting looked broken: a loose
+    drop is taken directly, but a monster's drops sit INSIDE a `corpse` ground
+    container, so we yield its contents instead of the corpse itself.
 
     The server reserves fresh drops for whoever earned them (`ownerId` +
-    `ownerExpiresAt`); taking someone else's is refused, so we filter to loot
-    that is ours or unowned rather than burning ticks on a rejected pickup.
-    Items we already failed to reach are skipped so one stuck drop behind a wall
-    can't stall the farm forever."""
+    `ownerExpiresAt`); taking someone else's is refused, so we skip those rather
+    than burn ticks on a rejected pickup. Items we already failed to reach are
+    skipped too, so one stuck drop can't stall the farm forever."""
     skip = getattr(bot, "_farm_loot_skip", frozenset())
-    mine = [g for g in (snap.get("groundItems") or [])
-            if g["id"] not in skip
-            and not (g.get("ownerId") and g["ownerId"] != bot.me)]
-    if not mine:
+    for g in (snap.get("groundItems") or []):
+        if g.get("ownerId") and g["ownerId"] != bot.me:
+            continue
+        it = g["item"]
+        if it.get("itemId") in LOOT_CONTAINERS or it.get("contents"):
+            for inner in (it.get("contents") or []):
+                if inner and inner["instanceId"] not in skip:
+                    yield g, inner
+        elif it["instanceId"] not in skip:
+            yield g, it
+
+
+def nearest_loot(bot, snap, me):
+    """The nearest (ground_entry, item) we're allowed to take, or None."""
+    cands = list(loot_candidates(bot, snap))
+    if not cands:
         return None
-    return min(mine, key=lambda g: dist_px(g["x"], g["y"], me["x"], me["y"]))
+    return min(cands, key=lambda c: dist_px(c[0]["x"], c[0]["y"],
+                                            me["x"], me["y"]))
 
 
 def pick_food(bot, emergency=False):
@@ -1348,10 +1371,11 @@ def _stackable(item_id, group):
 async def farm_loot_step(bot, snap, me):
     """Walk to the nearest lootable drop and take it. Returns True if we're busy
     looting (caller should not also try to fight this tick)."""
-    target = nearest_loot(bot, snap, me)
-    if not target:
+    found = nearest_loot(bot, snap, me)
+    if not found:
         bot._farm_chase = None
         return False
+    where, it = found
 
     free, cap = bot.pack_space()
     if cap and free == 0:
@@ -1364,33 +1388,34 @@ async def farm_loot_step(bot, snap, me):
     bot._farm_warned_full = False
 
     # Track how long we've chased this one so an unreachable drop can't stall
-    # the loop forever.
+    # the loop forever. Keyed on the ITEM, since several items can share one
+    # corpse and we take them out one at a time.
     chased, since = getattr(bot, "_farm_chase", None) or (None, 0.0)
-    if chased != target["id"]:
-        bot._farm_chase = (target["id"], _now())
+    if chased != it["instanceId"]:
+        bot._farm_chase = (it["instanceId"], _now())
     elif _now() - since > LOOT_TIMEOUT_S:
-        # Ban it, but keep the ban list bounded to ids still on the floor --
+        # Ban it, but keep the ban list bounded to items still on the floor --
         # otherwise a multi-hour run accumulates thousands of despawned ids and
         # tests every one of them, every tick.
-        on_floor = {g["id"] for g in (snap.get("groundItems") or [])}
+        on_floor = {i["instanceId"] for _, i in loot_candidates(bot, snap)}
         skip = getattr(bot, "_farm_loot_skip", set()) & on_floor
-        skip.add(target["id"])
+        skip.add(it["instanceId"])
         bot._farm_loot_skip = skip
         bot._farm_chase = None
-        print(f"  giving up on {target['item']['itemId']} (unreachable)")
+        print(f"  giving up on {it['itemId']} (unreachable)")
         return False
 
-    if dist_px(me["x"], me["y"], target["x"], target["y"]) > LOOT_REACH_PX:
-        await bot.move(*nav_step(bot, me, target["x"], target["y"]))
+    if dist_px(me["x"], me["y"], where["x"], where["y"]) > LOOT_REACH_PX:
+        await bot.move(*nav_step(bot, me, where["x"], where["y"]))
         return True
 
     await bot.move(0, 0)
     now = _now()
     if now - getattr(bot, "_farm_last_pickup", 0.0) >= 0.4:
         bot._farm_last_pickup = now
-        it = target["item"]
-        print(f"  looting {it['itemId']} x{it.get('quantity', 1)}")
-        await bot.pick_up(target)
+        src = " (corpse)" if where["item"].get("itemId") in LOOT_CONTAINERS else ""
+        print(f"  looting {it['itemId']} x{it.get('quantity', 1)}{src}")
+        await bot.take_item(it)
     return True
 
 

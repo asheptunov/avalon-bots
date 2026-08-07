@@ -55,7 +55,7 @@ class FakeBot:
         self.sent.append({"type": "talkTo", "npcId": npc, "optionId": opt})
 
     move_item = ab.AvalonBot.move_item
-    pick_up = ab.AvalonBot.pick_up
+    take_item = ab.AvalonBot.take_item
 
     def kinds(self):
         return [m["type"] for m in self.sent]
@@ -96,6 +96,14 @@ def rat(tile=(10, 10), hp=20, mid="rat1", mtype="rat"):
 def drop(tile=(10, 10), item_id="gold", qty=5, gid="g1", owner=None):
     return {"id": gid, "x": px(tile[0]), "y": px(tile[1]), "z": 0,
             "item": item(item_id, qty, f"i-{gid}"),
+            "ownerId": owner, "ownerExpiresAt": 0}
+
+
+def corpse(tile=(10, 10), contents=(), gid="c1", owner=None):
+    """A killed monster's remains: a ground container whose `contents` are the
+    real drops. This is how rats actually leave loot."""
+    return {"id": gid, "x": px(tile[0]), "y": px(tile[1]), "z": 0,
+            "item": item("corpse", 1, f"i-{gid}", contents=list(contents)),
             "ownerId": owner, "ownerExpiresAt": 0}
 
 
@@ -184,6 +192,59 @@ class TestLoot(unittest.TestCase):
         self.assertFalse(bot.of_type("moveItem"))
         self.assertTrue(bot._farm_warned_full)
         self.assertFalse(bot.done)   # keeps farming, does not exit
+
+    def test_loots_out_of_a_corpse(self):
+        """The bug from the live run: rats leave a `corpse` container and the
+        drops are INSIDE it, so taking the corpse itself loots nothing."""
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [],
+                        ground=[corpse((10, 10),
+                                       contents=[item("gold", 7, "loot-gold")])])
+        run(avalon.make_farm(cfg()), bot, snap)
+        mv = bot.of_type("moveItem")
+        self.assertEqual(len(mv), 1)
+        self.assertEqual(mv[0]["instanceId"], "loot-gold")   # not "i-c1"
+
+    def test_empty_corpse_is_not_a_loot_target(self):
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [], ground=[corpse((10, 10))])
+        run(avalon.make_farm(cfg(cook=False, stack=False)), bot, snap)
+        self.assertFalse(bot.of_type("moveItem"))
+
+    def test_walks_to_a_distant_corpse(self):
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [],
+                        ground=[corpse((16, 10),
+                                       contents=[item("gold", 7, "loot-gold")])])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertFalse(bot.of_type("moveItem"))
+        self.assertTrue(bot.of_type("move"))
+
+    def test_takes_multiple_items_from_one_corpse(self):
+        """Several drops share a corpse; we take them one per tick."""
+        bot = FakeBot(backpack([]))
+        body = corpse((10, 10), contents=[item("gold", 7, "l1"),
+                                          item("rawMeat", 2, "l2")])
+        intent = avalon.make_farm(cfg(cook=False, stack=False))
+        run(intent, bot, snapshot([me((10, 10))], [], ground=[body]))
+        first = bot.of_type("moveItem")[0]["instanceId"]
+        # Simulate the server removing the taken item from the corpse.
+        body["item"]["contents"] = [c for c in body["item"]["contents"]
+                                    if c["instanceId"] != first]
+        bot.sent.clear()
+        bot._farm_last_pickup = 0.0
+        run(intent, bot, snapshot([me((10, 10))], [], ground=[body]))
+        second = bot.of_type("moveItem")[0]["instanceId"]
+        self.assertNotEqual(first, second)
+        self.assertEqual({first, second}, {"l1", "l2"})
+
+    def test_skips_a_corpse_owned_by_someone_else(self):
+        bot = FakeBot(backpack([]))
+        snap = snapshot([me((10, 10))], [],
+                        ground=[corpse((10, 10), owner="rival",
+                                       contents=[item("gold", 7, "l1")])])
+        run(avalon.make_farm(cfg(cook=False, stack=False)), bot, snap)
+        self.assertFalse(bot.of_type("moveItem"))
 
     def test_no_loot_flag_disables_pickup(self):
         bot = FakeBot(backpack([]))

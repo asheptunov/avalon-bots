@@ -291,13 +291,18 @@ class AvalonBot:
             msg["quantity"] = quantity
         await self.send(msg)
 
-    async def pick_up(self, ground_item, quantity=None):
-        """Loot one ground item into the backpack (a `groundItems` entry from a
-        snapshot). Returns False if we have no backpack to put it in."""
+    async def take_item(self, item, quantity=None):
+        """Loot one item into the backpack.
+
+        `item` is the item itself, which may be lying loose on the floor OR
+        sitting inside a ground container (a monster's `corpse`) -- the server
+        addresses both the same way, by the item's own instanceId, so taking
+        loot out of a corpse needs no separate 'open' step. Returns False if we
+        have no backpack to put it in."""
         pack = self.backpack()
         if not pack:
             return False
-        await self.move_item(ground_item["item"]["instanceId"],
+        await self.move_item(item["instanceId"],
                              {"kind": "container",
                               "containerInstanceId": pack["instanceId"]},
                              quantity)
