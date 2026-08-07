@@ -463,6 +463,20 @@ class TestLiveRunRegressions(unittest.TestCase):
         self.assertFalse(bot.of_type("attack"))
         self.assertEqual(bot._farm_state, "RETREAT")
 
+    def test_stacks_while_fighting(self):
+        """Stacking sat in the idle branch too, so a pack full of split
+        slivers never got merged on a field that always has prey."""
+        bot = FakeBot(backpack([item("gold", 9, "g-a"), item("gold", 2, "g-b")]))
+        snap = snapshot([me((10, 10))], [rat((16, 10))])
+        run(avalon.make_farm(cfg(cook=False)), bot, snap)
+        self.assertEqual(bot.of_type("moveItem")[0]["instanceId"], "g-b")
+
+    def test_cooks_while_fighting(self):
+        bot = FakeBot(backpack([item("rawMeat", 2, "raw1")]))
+        snap = snapshot([me((10, 10))], [rat((16, 10))])
+        run(avalon.make_farm(cfg()), bot, snap)
+        self.assertEqual(bot.of_type("useItem")[0]["instanceId"], "raw1")
+
     def test_loots_nearby_corpse_before_chasing_the_next_rat(self):
         """He left every corpse behind because loot sat behind the fight
         branch and there was always another rat to chase."""

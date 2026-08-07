@@ -1603,6 +1603,10 @@ def make_farm(cfg):
         # bled out with a full bag of apples.) It's throttled and costs one
         # message, so running it every tick is cheap.
         await farm_eat_step(bot, me, cfg)
+        # Same reasoning for cooking and stacking: they're pure inventory moves
+        # that don't need us to stand still, and merging stacks is what keeps
+        # the pack from filling with slivers. Both are throttled internally.
+        await farm_cook_and_stack(bot, cfg)
 
         # --- retreat / resume hysteresis --------------------------------
         if frac <= cfg.retreat_frac:
@@ -1668,15 +1672,9 @@ def make_farm(cfg):
                          lambda: f"chasing {m['monsterType']} {d/TILE:.1f} tiles")
             return
 
-        # --- nothing to fight: loot, then keep house --------------------
+        # --- nothing to fight: sweep up the rest of the loot -------------
         if cfg.loot and await farm_loot_step(bot, snap, me):
             farm_log(bot, "LOOT")
-            return
-
-        await bot.move(0, 0)
-        if await farm_cook_and_stack(bot, cfg):
-            return
-        if await farm_eat_step(bot, me, cfg):
             return
 
         # Idle: no prey in sight. Roam so we find the next spawn instead of
