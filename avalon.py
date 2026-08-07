@@ -220,6 +220,21 @@ async def intent_respawn(bot, snap):
     bot.done = True
 
 
+async def respawn_if_dead(bot, me):
+    """If the bot is dead, send a respawn (throttled) and report True so the
+    caller skips this tick -- a corpse can't fight or follow, and swarm bots
+    WILL die (esp. to underground monsters), so they need to get back up on their
+    own. Returns True while dead."""
+    if me["hp"] > 0:
+        return False
+    now = _now()
+    if now - getattr(bot, "_respawn_last", 0.0) > 2.0:
+        bot._respawn_last = now
+        await bot.send({"type": "respawn"})
+        print(f"{me['name']}: dead -- respawning", file=sys.stderr)
+    return True
+
+
 # HP-restoring potions, smallest first, with their heal amount (from the
 # bundle's `ff={healthPotion:30,largeHealthPotion:60}`). Mana potions don't
 # heal HP, so they're excluded.
@@ -299,7 +314,10 @@ def make_heal(force_healer=False):
 
 async def heal_on_event(bot, msg):
     """Dialogue handler for the Aldric heal path: when the dialogue arrives,
-    pick the option whose label looks like healing and send it back."""
+    pick the option whose label looks like healing and send it back.
+
+    `heal` is a one-shot and exits after this; `farm` heals repeatedly over a
+    long run, so it sets `bot.heal_once = False` to keep the loop alive."""
     if msg.get("type") != "dialogue":
         return
     if msg.get("npcId") != getattr(bot, "_heal_npc", None):
@@ -314,6 +332,11 @@ async def heal_on_event(bot, msg):
     else:
         labels = [o.get("label") for o in opts]
         print(f"  no heal option in dialogue; options were: {labels}")
+    # Close the dialogue so the NPC isn't left mid-conversation on a long run.
+    if not getattr(bot, "heal_once", True):
+        await bot.send({"type": "endDialogue"})
+        bot._heal_npc = None
+        return
     bot.done = True
 
 
@@ -923,6 +946,8 @@ def make_swarm(leader_name, cfg, focus_radius_px, is_leader,
         me = me_of(bot, snap)
         if not me:
             return
+        if await respawn_if_dead(bot, me):
+            return
         set_nav_obstacles(bot, snap, me)
 
         raw, members, leader = party_readiness(snap, cfg, leader_name)
@@ -993,6 +1018,8 @@ def make_swarm_leader(cfg, focus_radius_px):
     async def intent(bot, snap):
         me = me_of(bot, snap)
         if not me:
+            return
+        if await respawn_if_dead(bot, me):
             return
         set_nav_obstacles(bot, snap, me)
         # Anchor readiness on our own name so cohesion measures the escorts'
@@ -1103,13 +1130,16 @@ def lootable_items(bot, snap, ignore=LOOT_IGNORE):
 
     The server reserves fresh drops for whoever earned them (`ownerId` +
     `ownerExpiresAt`); taking someone else's is refused, so we filter to loot
-    that is ours or unowned rather than burning ticks on a rejected pickup."""
+    that is ours or unowned rather than burning ticks on a rejected pickup.
+    Items we already failed to reach are skipped so one stuck drop behind a wall
+    can't stall the farm forever."""
     me = me_of(bot, snap)
     if not me:
         return []
+    skip = getattr(bot, "_farm_loot_skip", frozenset())
     items = []
     for g in (snap.get("groundItems") or []):
-        if g["item"].get("itemId") in ignore:
+        if g["item"].get("itemId") in ignore or g["id"] in skip:
             continue
         owner = g.get("ownerId")
         if owner and owner != bot.me:
@@ -1358,6 +1388,9 @@ def make_farm(cfg):
         if not me:
             return
         set_nav_obstacles(bot, snap, me)
+        # Farming heals many times over a long run, so the dialogue handler must
+        # not treat the first heal as the end of the job.
+        bot.heal_once = False
 
         if me["hp"] <= 0:
             if not getattr(bot, "_farm_dead", False):
@@ -1542,8 +1575,23 @@ def build_intent(args):
     if args.cmd == "heal":
         return make_heal(force_healer=args.healer), heal_on_event
     if args.cmd == "farm":
-        frac = (args.until_hp / 100.0) if args.until_hp is not None else None
-        return make_farm(frac), None
+        hunt = {h.strip() for h in args.hunt.split(",") if h.strip()}
+        cfg = FarmConfig(
+            loot=not args.no_loot,
+            eat=not args.no_eat,
+            cook=not args.no_cook,
+            stack=not args.no_stack,
+            hunt_types=None if (not hunt or "*" in hunt) else hunt,
+            retreat_frac=args.retreat_hp / 100.0,
+            resume_frac=args.resume_hp / 100.0,
+            heal_to_frac=args.heal_to / 100.0,
+            healer_name=args.healer,
+            roam_px=args.roam * TILE,
+            until_hp_frac=(args.until_hp / 100.0
+                           if args.until_hp is not None else None),
+        )
+        # The heal dialogue at the healer reuses `heal`'s option picker.
+        return make_farm(cfg), heal_on_event
     if args.cmd == "follow":
         return make_follow(args.target, args.keep * TILE), None
     if args.cmd in ("escort", "lead"):
@@ -1743,9 +1791,36 @@ def main():
     h.add_argument("--healer", action="store_true",
                    help="skip potions; go straight to Brother Aldric")
 
-    fa = sub.add_parser("farm", help="fight nearby monsters until Ctrl-C")
+    fa = sub.add_parser("farm",
+                        help="farm indefinitely: kill, loot, cook, eat, "
+                             "retreat + heal when hurt. Runs until Ctrl-C.")
     fa.add_argument("--until-hp", type=float, default=None, metavar="PCT",
-                    help="stop and exit once HP drops to this %% (e.g. 50)")
+                    help="stop and exit once HP drops to this %% (e.g. 50); "
+                         "by default farming never stops on its own")
+    fa.add_argument("--hunt", default="rat",
+                    help="comma-separated monster types to kill; '*' means "
+                         "anything (default 'rat')")
+    fa.add_argument("--retreat-hp", type=float, default=35, metavar="PCT",
+                    help="disengage and fall back below this %% HP (default 35)")
+    fa.add_argument("--resume-hp", type=float, default=85, metavar="PCT",
+                    help="resume fighting once back above this %% HP "
+                         "(default 85; hysteresis against flip-flopping)")
+    fa.add_argument("--heal-to", type=float, default=95, metavar="PCT",
+                    help="heal up to this %% at the healer (default 95)")
+    fa.add_argument("--healer", default="aldric", metavar="NAME",
+                    help="NPC to retreat to and heal at (default 'aldric'); "
+                         "empty string = just back away from the threat")
+    fa.add_argument("--roam", type=int, default=12, metavar="TILES",
+                    help="how far to wander looking for the next spawn "
+                         "(default 12 tiles)")
+    fa.add_argument("--no-loot", action="store_true",
+                    help="don't pick drops up")
+    fa.add_argument("--no-eat", action="store_true",
+                    help="don't eat (WARNING: HP only regenerates while fed)")
+    fa.add_argument("--no-cook", action="store_true",
+                    help="don't cook raw meat into cooked")
+    fa.add_argument("--no-stack", action="store_true",
+                    help="don't merge split stacks in the backpack")
 
     f = sub.add_parser("follow", help="follow a player until Ctrl-C")
     f.add_argument("target")

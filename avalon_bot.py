@@ -229,6 +229,7 @@ class AvalonBot:
         self.me = None          # id of our player
         self.state = {}         # latest decoded snapshot
         self.ground_rev = -1
+        self.ground_items = []  # last known floor contents (see run())
         self.z = None
         self.fleeing = False    # set by the AI when HP gets low
         self.equipment = {}     # slot -> item dict (from `welcome`/`equipmentUpdate`)
@@ -403,6 +404,14 @@ class AvalonBot:
                 if op == SRV_SNAPSHOT:
                     snap = decode_snapshot(raw, self.ground_rev, self.z)
                     self.ground_rev, self.z = snap["groundRev"], snap["z"]
+                    # Ground items are only re-sent when the revision changes,
+                    # so most snapshots carry None meaning "unchanged", NOT
+                    # "no items". Carry the last known list forward or every
+                    # consumer would see an empty floor on 99% of ticks.
+                    if snap["groundItems"] is None:
+                        snap["groundItems"] = self.ground_items
+                    else:
+                        self.ground_items = snap["groundItems"]
                     self.state = snap
                     if on_snapshot:
                         await on_snapshot(self, snap)
