@@ -40,6 +40,13 @@ jobs:
         working-directory: web
         run: npm ci || npm install
 
+      # Snapshot the COMMITTED script before any build overwrites it. Doing this
+      # after a build would compare the rebuilt file against itself, and the
+      # staleness check below would pass unconditionally.
+      - name: Snapshot the committed userscript
+        working-directory: web
+        run: cp avalon-farm.user.js "$RUNNER_TEMP/committed.user.js"
+
       # Extract maps from the live client so the fallback shipped in the build is
       # current. Non-fatal: if the game is unreachable we fall back to the
       # committed snapshot rather than failing the build.
@@ -60,16 +67,16 @@ jobs:
       # src/ and forgetting to rebuild, which leaves a stale script that installs
       # cleanly and behaves like the old code -- a confusing failure to chase.
       # Rebuild from the COMMITTED maps (not the freshly-extracted ones, which
-      # legitimately differ whenever the game has redeployed) and diff.
+      # legitimately differ whenever the game has redeployed) and diff against the
+      # snapshot taken before any build ran.
       - name: Check the committed userscript is up to date
         working-directory: web
         run: |
-          git checkout -- maps.json 2>/dev/null || true
-          cp avalon-farm.user.js /tmp/committed.user.js
+          git checkout -- maps.json
           node build.mjs
-          if ! diff -q /tmp/committed.user.js avalon-farm.user.js; then
+          if ! diff -q "$RUNNER_TEMP/committed.user.js" avalon-farm.user.js; then
             echo "::error::web/avalon-farm.user.js is stale. Run: cd web && node build.mjs"
-            diff /tmp/committed.user.js avalon-farm.user.js | head -40
+            diff "$RUNNER_TEMP/committed.user.js" avalon-farm.user.js | head -40
             exit 1
           fi
 
