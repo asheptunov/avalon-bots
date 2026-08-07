@@ -152,17 +152,23 @@ escorts converge on the same monster (lowest-HP-first) → focus fire emerges.
   entities on the VIEWER's own floor (every player/monster is stamped with the
   viewer's z). So when the leader descends, they simply VANISH from the escorts'
   snapshots — there's no "leader moved to z=-1" signal.
-- **Follow heuristic (last-seen-hole, no comms):** each escort remembers the
-  leader's floor+tile while visible (`track_leader`). When the leader vanishes
-  AND was last seen on a different floor, the escort heads to the teleport on ITS
-  floor nearest the leader's last-seen tile and takes it (walk onto a hole, or
-  approach a ladder + `useTeleport`) — `follow_across_floors`. After
-  transitioning, z updates, it re-sees the leader, normal follow resumes.
-  - Limitation: guesses the nearest teleport; can pick wrong if the leader took a
-    far/second teleport before the escort caught up. Good enough for "you walked
-    into a hole they were trailing you toward."
-  - **NOT yet live-tested** — the whole z-follow path (incl. whether walk-holes
-    transition a bot exactly like the browser) needs an in-game run.
+- **Follow trigger (last-seen-AT-a-teleport, no comms):** each escort remembers
+  the leader's floor+tile while visible (`track_leader`). We CANNOT know the
+  leader's new z (it's off our floor → invisible), so we can't trigger on "their
+  z ≠ mine" — an early version did exactly that and it NEVER fired (the recorded
+  z always equaled our own, since we only see them when co-located). Correct
+  trigger: the leader vanished AND was last seen ON/next to a teleport on OUR
+  floor (within `TELEPORT_TRIGGER_TILES`=2) → they took it → we take it too (walk
+  onto a hole; approach a ladder + `useTeleport`) — `follow_across_floors`. If
+  they vanished away from any teleport (just walked out of view), we hold.
+  Because a z=0 hole and the z=-1 ladder back up share the same tile coords, an
+  escort that overshoots a floor self-heals (finds the return ladder at the same
+  tile). `_xfloor_note` re-arms on every fresh sighting.
+  - Limitation: guesses the nearest teleport to the last-seen tile; fine for
+    "you stepped into the hole they were trailing you toward."
+  - **Live status:** first live run FAILED (the z≠mine trigger never fired; one
+    escort drifted down and got stuck). Trigger reworked + unit-tested; re-test
+    pending.
 
 ## Key facts / constraints
 

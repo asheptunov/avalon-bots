@@ -275,6 +275,33 @@ class AvalonBot:
     async def use_item(self, instance_id):
         await self.send({"type": "useItem", "instanceId": instance_id})
 
+    async def move_item(self, instance_id, to, quantity=None):
+        """The one verb behind looting, stacking and dropping.
+
+        `to` is a destination descriptor, mirroring the client's drag targets:
+          {"kind":"container","containerInstanceId":X[,"slotIndex":N]}
+          {"kind":"equipment","slot":"chest"}
+          {"kind":"ground","x":px,"y":px}
+        Picking a ground item up is just a moveItem whose instanceId belongs to
+        an item lying on the floor -- the client maps groundItem.id ->
+        item.instanceId and sends exactly this."""
+        msg = {"type": "moveItem", "instanceId": instance_id, "to": to}
+        if quantity is not None:
+            msg["quantity"] = quantity
+        await self.send(msg)
+
+    async def pick_up(self, ground_item, quantity=None):
+        """Loot one ground item into the backpack (a `groundItems` entry from a
+        snapshot). Returns False if we have no backpack to put it in."""
+        pack = self.backpack()
+        if not pack:
+            return False
+        await self.move_item(ground_item["item"]["instanceId"],
+                             {"kind": "container",
+                              "containerInstanceId": pack["instanceId"]},
+                             quantity)
+        return True
+
     async def talk_to(self, npc_id, option_id=None):
         """Open a dialogue (no option_id) or pick an option (with one)."""
         msg = {"type": "talkTo", "npcId": npc_id}
@@ -304,6 +331,40 @@ class AvalonBot:
     def count_item(self, item_id):
         return sum(it.get("quantity", 0) for it in self.iter_items()
                    if it.get("itemId") == item_id)
+
+    def items_by_id(self, item_id):
+        """Every held stack of one itemId -- several exist when loot arrives as
+        separate stacks that the server didn't merge (what `stack` fixes)."""
+        return [it for it in self.iter_items() if it.get("itemId") == item_id]
+
+    def backpack(self):
+        """The equipped backpack (the only container we loot into), or None.
+
+        `contents` is a fixed-length list with None in the empty slots, so its
+        length is the capacity and the Nones are the free space."""
+        return next((it for it in self.equipment.values()
+                     if it and it.get("contents") is not None), None)
+
+    def pack_space(self):
+        """(free_slots, capacity) for the backpack; (0, 0) with no backpack.
+
+        Slots -- not weight -- are the real carry limit: the server has weight
+        values for flavour but no capacity cap, while a container has a fixed
+        number of slots."""
+        pack = self.backpack()
+        if not pack:
+            return 0, 0
+        contents = pack.get("contents") or []
+        return sum(1 for c in contents if c is None), len(contents)
+
+    def has_status(self, kind):
+        """True if a server status effect (e.g. 'wellFed') is currently active.
+
+        Statuses arrive on `welcome`/`playerStats` as
+        [{"kind":..., "remainingMs":..., "magnitude":...}]. `wellFed` is the
+        load-bearing one: HP only regenerates while you are fed."""
+        return any(s.get("kind") == kind
+                   for s in (self.stats.get("statusEffects") or []))
 
     async def run(self, on_snapshot=None, on_event=None):
         import websockets

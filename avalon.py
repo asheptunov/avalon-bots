@@ -671,36 +671,43 @@ def rally_step(me, members, snap, cfg, leader):
 TELEPORT_INTERACT_PX = TILE * 1.4
 
 
+# How near the leader's last-seen tile a teleport must be to conclude "the leader
+# took THIS teleport and vanished" (tiles). The leader has to be basically on the
+# marker for us to chase it -- otherwise we'd dive down a hole any time they
+# merely walked out of view near one.
+TELEPORT_TRIGGER_TILES = 2
+
+
 async def follow_across_floors(bot, me, snap):
-    """Follow a leader who has DESCENDED/ASCENDED and thus vanished from our
-    snapshot (the server only sends entities on our own floor). We can't see
-    which teleport they took, so we use the last-seen-hole heuristic: head to the
-    teleport on OUR floor nearest to where the leader was last seen, and take it
-    (walk onto a hole; get close to a ladder and `useTeleport`). After the
-    transition our z changes, we re-see the leader, and normal follow resumes.
+    """Follow a leader who has DESCENDED/ASCENDED and thus VANISHED from our
+    snapshot (the server only sends entities on our own floor -- we get no signal
+    of their new z). We can't know where they went, so we key off OBSERVABLE
+    evidence: the leader was last seen standing on/next to a teleport on OUR
+    floor, and is now gone -> they almost certainly took it, so we take it too
+    (walk onto a hole; approach a ladder and `useTeleport`). After transitioning,
+    our z changes, we re-see the leader, and normal follow resumes.
 
     Returns True if it issued a move/teleport this tick (caller should return),
-    False if there's nothing to do (no last-seen leader, or no matching teleport)."""
+    False if there's nothing to chase (leader never seen, or wasn't near a
+    teleport when they vanished -- they just walked out of view)."""
     seen = getattr(bot, "_leader_last", None)
     if not seen:
         return False
-    lz, ltile = seen["z"], seen["tile"]
+    ltile = seen["tile"]
     z = getattr(bot, "z", 0)
-    # If the leader was last seen on OUR floor, they didn't change floors (they
-    # just walked out of view); don't chase a teleport.
-    if lz == z:
-        return False
 
-    # Which teleport on our floor reaches the leader's floor, nearest to where we
-    # last saw them? (Prefer one that reaches lz directly; fall back to any.)
-    tp = nav.nearest_teleport(z, lz, ltile) or (
-        min((t for t in nav.teleports(z)),
-            key=lambda t: (t["fromTile"][0] - ltile[0]) ** 2
-            + (t["fromTile"][1] - ltile[1]) ** 2, default=None))
-    if not tp:
+    # Only chase if the leader vanished while ON/next to a teleport on OUR floor.
+    # The nearest teleport to their last-seen tile must be within a tile or two;
+    # otherwise they didn't teleport (they walked off-view) and we hold.
+    tps = nav.teleports(z)
+    if not tps:
         return False
-
+    tp = min(tps, key=lambda t: (t["fromTile"][0] - ltile[0]) ** 2
+             + (t["fromTile"][1] - ltile[1]) ** 2)
     ftx, fty = tp["fromTile"]
+    if max(abs(ftx - ltile[0]), abs(fty - ltile[1])) > TELEPORT_TRIGGER_TILES:
+        return False                    # leader wasn't at a teleport -> don't dive
+
     goal_px = (ftx * TILE, fty * TILE)
     d = dist_px(me["x"], me["y"], *goal_px)
     if tp["mode"] == "walk":
@@ -713,19 +720,22 @@ async def follow_across_floors(bot, me, snap):
             await bot.use_teleport()
         else:
             await bot.move(*nav_step(bot, me, *goal_px))
-    if not getattr(bot, "_xfloor_note", False) or bot._xfloor_note != (z, lz):
-        bot._xfloor_note = (z, lz)
-        print(f"escort {me['name']}: leader on z{lz}, taking {tp['mode']} "
-              f"@({ftx},{fty}) from z{z}", file=sys.stderr)
+    if getattr(bot, "_xfloor_note", None) != (z, ftx, fty):
+        bot._xfloor_note = (z, ftx, fty)
+        print(f"escort {me['name']}: leader vanished at ({ltile[0]},{ltile[1]}) "
+              f"on a {tp['mode']} -> taking it @({ftx},{fty}) from z{z}",
+              file=sys.stderr)
     return True
 
 
 def track_leader(bot, leader):
     """Remember the leader's floor+tile whenever we can see them, so if they
-    vanish (changed floors) we know where to chase (follow_across_floors)."""
+    vanish next to a teleport we know to chase them through it. Clear it once we
+    actually re-acquire on a new floor so a stale last-seen can't re-trigger."""
     if leader:
         bot._leader_last = {"z": getattr(bot, "z", 0),
                             "tile": (nav._tile(leader["x"]), nav._tile(leader["y"]))}
+        bot._xfloor_note = None         # re-armed: fresh sighting
 
 
 def follow_leader_step(bot, me, leader, snap, cfg):
@@ -1064,22 +1074,419 @@ def make_move(spec):
     return intent
 
 
-def make_farm(until_hp_frac=None):
-    """Fight nearby monsters. If until_hp_frac is set, stop and exit cleanly
-    once HP falls to that fraction (a safe grind-to-X%, no death spiral)."""
+# --------------------------------------------------------------------------
+# farming: an indefinite kill -> loot -> stay-alive loop
+# --------------------------------------------------------------------------
+
+# Food, best-first. `Xg` in the bundle gives how long each keeps you `wellFed`
+# (ms); we eat the WORST food that still does the job so the good stuff is kept
+# for when it matters. cookedMeat (480s) is worth more than double rawMeat
+# (180s), which is why we cook before eating.
+FOOD_ITEMS = [
+    ("cookedMeat", 480), ("fish", 1200), ("cheese", 240),
+    ("apple", 120), ("avocado", 120), ("iceCream", 120), ("rawMeat", 180),
+]
+# Raw -> what it becomes when you interact with it near a fire.
+COOKABLE = {"rawMeat": "cookedMeat"}
+# Junk we never bother picking up (nothing yet -- rats drop little, and gold
+# stacks to a single slot, so by default we take everything).
+LOOT_IGNORE: set = set()
+
+# How close we must be to a ground item before `moveItem` will pick it up.
+LOOT_REACH_PX = TILE * 1.2
+# Give up on a single item after this long (it may be unreachable or owned).
+LOOT_TIMEOUT_S = 6.0
+
+
+def lootable_items(bot, snap, ignore=LOOT_IGNORE):
+    """Ground items we're allowed to take, nearest first.
+
+    The server reserves fresh drops for whoever earned them (`ownerId` +
+    `ownerExpiresAt`); taking someone else's is refused, so we filter to loot
+    that is ours or unowned rather than burning ticks on a rejected pickup."""
+    me = me_of(bot, snap)
+    if not me:
+        return []
+    items = []
+    for g in (snap.get("groundItems") or []):
+        if g["item"].get("itemId") in ignore:
+            continue
+        owner = g.get("ownerId")
+        if owner and owner != bot.me:
+            continue
+        items.append(g)
+    return sorted(items, key=lambda g: dist_px(g["x"], g["y"], me["x"], me["y"]))
+
+
+def pick_food(bot, emergency=False):
+    """Choose what to eat: the shortest-lasting food that still feeds us, so
+    long-lasting food is saved. In an emergency (hurt and starving) any food
+    will do -- being fed at all is what restores regen."""
+    held = [(iid, secs) for iid, secs in FOOD_ITEMS if bot.find_item(iid)]
+    if not held:
+        return None
+    if emergency:
+        return min(held, key=lambda p: p[1])[0]
+    # Prefer the cheapest adequate option; FOOD_ITEMS order breaks ties.
+    return min(held, key=lambda p: p[1])[0]
+
+
+class FarmConfig:
+    """Thresholds for the farm loop. All fractions are of maxHp."""
+
+    def __init__(self, loot=True, eat=True, cook=True, stack=True,
+                 hunt_types=None, retreat_frac=0.35, resume_frac=0.85,
+                 heal_to_frac=0.95, healer_name=None, roam_px=TILE * 12,
+                 until_hp_frac=None):
+        self.loot = loot
+        self.eat = eat
+        self.cook = cook
+        self.stack = stack
+        self.hunt_types = hunt_types
+        self.retreat_frac = retreat_frac
+        self.resume_frac = resume_frac
+        self.heal_to_frac = heal_to_frac
+        self.healer_name = healer_name
+        self.roam_px = roam_px
+        self.until_hp_frac = until_hp_frac
+
+
+async def farm_cook_and_stack(bot, cfg):
+    """Housekeeping between fights: cook raw meat, then consolidate stacks.
+
+    Returns True if we sent something (so the caller yields this tick -- the
+    server applies one inventory action at a time and we want to see the result
+    in the next snapshot before deciding again)."""
+    now = _now()
+    if now - getattr(bot, "_farm_last_inv", 0.0) < 0.6:
+        return False
+
+    if cfg.cook:
+        for raw in COOKABLE:
+            it = bot.find_item(raw)
+            if it:
+                bot._farm_last_inv = now
+                print(f"  cooking {raw} x{it.get('quantity', 1)}")
+                await bot.use_item(it["instanceId"])
+                return True
+
+    if cfg.stack:
+        merge = find_merge(bot)
+        if merge:
+            src, dst = merge
+            bot._farm_last_inv = now
+            print(f"  stacking {src['itemId']} "
+                  f"x{src.get('quantity', 1)} onto x{dst.get('quantity', 1)}")
+            await bot.move_item(src["instanceId"],
+                                {"kind": "container",
+                                 "containerInstanceId": dst["_container"],
+                                 "slotIndex": dst["_slot"]})
+            return True
+    return False
+
+
+def find_merge(bot):
+    """Find two stacks of the same item that should be one, as
+    (source, dest-with-location). Merging frees slots, which is the whole point:
+    a backpack fills with split stacks long before it fills with distinct items.
+
+    Only stackables qualify -- an item the server gave a quantity > 1 anywhere,
+    or a known-stackable id. Equipment never stacks, so a second sword is not a
+    merge candidate."""
+    pack = bot.backpack()
+    if not pack:
+        return None
+    contents = pack.get("contents") or []
+    # Group the backpack's top-level slots by itemId, keeping slot indices so we
+    # can address the destination precisely.
+    by_id = {}
+    for slot, it in enumerate(contents):
+        if not it or it.get("contents") is not None:
+            continue   # empty slot, or a nested container (never merge those)
+        by_id.setdefault(it["itemId"], []).append((slot, it))
+
+    for item_id, group in by_id.items():
+        if len(group) < 2:
+            continue
+        if not _stackable(item_id, group):
+            continue
+        # Pour the smallest stack into the largest: fewest moves to empty a slot.
+        group.sort(key=lambda p: p[1].get("quantity", 1))
+        src_slot, src = group[0]
+        dst_slot, dst = group[-1]
+        if src_slot == dst_slot:
+            continue
+        dst = dict(dst, _container=pack["instanceId"], _slot=dst_slot)
+        return src, dst
+    return None
+
+
+# Items the server keeps as counted stacks. Anything we've actually observed
+# with quantity > 1 is stackable by definition; this list seeds the ones we
+# expect to loot before we've seen a multi-stack of them.
+STACKABLE_IDS = {
+    "gold", "rawMeat", "cookedMeat", "cheese", "apple", "fish", "avocado",
+    "healthPotion", "largeHealthPotion", "manaPotion", "largeManaPotion",
+    "emberOre", "iceCream",
+}
+
+
+def _stackable(item_id, group):
+    if item_id in STACKABLE_IDS:
+        return True
+    # Learned at runtime: the server itself is holding >1 in a slot.
+    return any(it.get("quantity", 1) > 1 for _, it in group)
+
+
+async def farm_loot_step(bot, snap, me, cfg):
+    """Walk to the nearest lootable drop and take it. Returns True if we're busy
+    looting (caller should not also try to fight this tick)."""
+    items = lootable_items(bot, snap)
+    if not items:
+        bot._farm_loot_target = None
+        return False
+
+    free, cap = bot.pack_space()
+    if cap and free == 0:
+        # Full: say so once, keep fighting, stop trying to loot.
+        if not getattr(bot, "_farm_warned_full", False):
+            bot._farm_warned_full = True
+            print(f"!! BACKPACK FULL ({cap}/{cap} slots) -- leaving loot on the "
+                  "ground and carrying on. Sell/stash to make room.")
+        return False
+    bot._farm_warned_full = False
+
+    target = items[0]
+    # Track how long we've chased this one so an unreachable drop can't stall
+    # the loop forever.
+    prev = getattr(bot, "_farm_loot_target", None)
+    if prev != target["id"]:
+        bot._farm_loot_target = target["id"]
+        bot._farm_loot_since = _now()
+    elif _now() - getattr(bot, "_farm_loot_since", 0.0) > LOOT_TIMEOUT_S:
+        bot._farm_loot_skip = getattr(bot, "_farm_loot_skip", set()) | {target["id"]}
+        bot._farm_loot_target = None
+        print(f"  giving up on {target['item']['itemId']} (unreachable)")
+        return False
+
+    if dist_px(me["x"], me["y"], target["x"], target["y"]) > LOOT_REACH_PX:
+        await bot.move(*nav_step(bot, me, target["x"], target["y"]))
+        return True
+
+    await bot.move(0, 0)
+    now = _now()
+    if now - getattr(bot, "_farm_last_pickup", 0.0) >= 0.4:
+        bot._farm_last_pickup = now
+        it = target["item"]
+        print(f"  looting {it['itemId']} x{it.get('quantity', 1)}")
+        await bot.pick_up(target)
+    return True
+
+
+async def farm_eat_step(bot, me, cfg):
+    """Eat if we're not `wellFed`. This is not a nicety: the server only
+    regenerates HP while the wellFed status is up, so an unfed bot never heals
+    between fights and bleeds down to a death spiral.
+
+    Returns True if we ate (or tried to) this tick."""
+    if not cfg.eat or bot.has_status("wellFed"):
+        return False
+    now = _now()
+    if now - getattr(bot, "_farm_last_eat", 0.0) < 1.5:
+        return False
+    hurt = me["hp"] < me["maxHp"] * cfg.resume_frac
+    food = pick_food(bot, emergency=hurt)
+    if not food:
+        if not getattr(bot, "_farm_warned_food", False):
+            bot._farm_warned_food = True
+            print("!! OUT OF FOOD -- not wellFed, so HP will NOT regenerate. "
+                  "Farming continues but retreats will take a while.")
+        return False
+    bot._farm_warned_food = False
+    it = bot.find_item(food)
+    bot._farm_last_eat = now
+    print(f"  eating {food} (x{bot.count_item(food)} held) -- restoring regen")
+    await bot.use_item(it["instanceId"])
+    return True
+
+
+def farm_threats(snap, me, hunt_types):
+    """Living monsters worth fighting, nearest first."""
+    out = [m for m in snap["monsters"] if m["hp"] > 0
+           and (not hunt_types or m["monsterType"] in hunt_types)]
+    return sorted(out, key=lambda m: dist_px(m["x"], m["y"], me["x"], me["y"]))
+
+
+def retreat_step(bot, me, snap, cfg):
+    """Back away toward safety. If we know a healer, retreat TO them (they're a
+    safe spot and the heal is there); otherwise just put distance between us and
+    the nearest monster."""
+    if cfg.healer_name:
+        healer = next((n for n in snap["npcs"]
+                       if name_matches(cfg.healer_name,
+                                       n.get("name") or n.get("npcType") or "")),
+                      None)
+        if healer:
+            if dist_px(me["x"], me["y"], healer["x"], healer["y"]) > TILE * 1.5:
+                return nav_step(bot, me, healer["x"], healer["y"]), healer
+            return (0, 0), healer
+    monsters = [m for m in snap["monsters"] if m["hp"] > 0]
+    if not monsters:
+        return (0, 0), None
+    near = min(monsters, key=lambda m: dist_px(m["x"], m["y"], me["x"], me["y"]))
+    dx, dy = step_toward(me, near["x"], near["y"])
+    return (-dx, -dy), None
+
+
+def make_farm(cfg):
+    """Farm indefinitely: kill -> loot -> cook/stack -> eat -> stay alive.
+
+    A small state machine with hysteresis, so it can run unattended for hours:
+
+      FIGHT    kill the nearest huntable monster
+      LOOT     nothing hostile in reach -> sweep up the drops
+      KEEP     no monsters, no loot -> cook raw meat, merge stacks, eat
+      RETREAT  HP below retreat_frac -> disengage toward the healer
+      HEAL     at the healer -> potion/dialogue back up to heal_to_frac
+
+    The RETREAT/FIGHT split is hysteretic (retreat_frac vs resume_frac) so a bot
+    hovering at the threshold doesn't oscillate between fleeing and swinging.
+    Eating is what makes 'indefinitely' possible at all: HP only regenerates
+    while wellFed."""
     async def intent(bot, snap):
         me = me_of(bot, snap)
-        if me and until_hp_frac is not None:
-            frac = me["hp"] / max(1, me["maxHp"])
-            if frac <= until_hp_frac:
+        if not me:
+            return
+        set_nav_obstacles(bot, snap, me)
+
+        if me["hp"] <= 0:
+            if not getattr(bot, "_farm_dead", False):
+                bot._farm_dead = True
+                print("died -- respawning")
+            await bot.send({"type": "respawn"})
+            return
+        bot._farm_dead = False
+
+        frac = me["hp"] / max(1, me["maxHp"])
+
+        # Optional hard stop (kept from the old farm: grind to X% and exit).
+        if cfg.until_hp_frac is not None and frac <= cfg.until_hp_frac:
+            await bot.move(0, 0)
+            print(f"reached {me['hp']}/{me['maxHp']} "
+                  f"({frac*100:.0f}% <= {cfg.until_hp_frac*100:.0f}%) -- stopping")
+            bot.done = True
+            return
+
+        # --- retreat / resume hysteresis --------------------------------
+        if frac <= cfg.retreat_frac:
+            bot.fleeing = True
+        elif frac >= cfg.resume_frac:
+            bot.fleeing = False
+
+        if bot.fleeing:
+            # Eating first: regen is the actual healing mechanism, and it works
+            # while we walk. Then back off and let it tick.
+            await farm_eat_step(bot, me, cfg)
+            (dx, dy), healer = retreat_step(bot, me, snap, cfg)
+            farm_log(bot, f"RETREAT hp={me['hp']}/{me['maxHp']} "
+                          f"({frac*100:.0f}%)"
+                          + (" at healer" if healer and (dx, dy) == (0, 0) else ""))
+            await bot.move(dx, dy)
+            if healer and (dx, dy) == (0, 0):
+                await farm_heal_at(bot, me, healer, cfg)
+            return
+
+        # --- fight ------------------------------------------------------
+        monsters = farm_threats(snap, me, cfg.hunt_types)
+        if monsters:
+            m = monsters[0]
+            d = dist_px(m["x"], m["y"], me["x"], me["y"])
+            if d < ab.MELEE_RANGE_PX:
                 await bot.move(0, 0)
-                print(f"reached {me['hp']}/{me['maxHp']} "
-                      f"({frac*100:.0f}% <= {until_hp_frac*100:.0f}%) -- stopping")
-                bot.done = True
-                return
-        # Reuse the flee-aware combat AI already in avalon_bot.
-        await ab.example_ai(bot, snap)
+                await bot.attack(m["id"])
+                farm_log(bot, f"FIGHT {m['monsterType']} "
+                              f"{m['hp']}/{m['maxHp']} hp={me['hp']}")
+            else:
+                await bot.move(*nav_step(bot, me, m["x"], m["y"]))
+                farm_log(bot, f"CHASE {m['monsterType']} {d/TILE:.1f} tiles")
+            return
+
+        # --- nothing to fight: loot, then keep house --------------------
+        if cfg.loot and await farm_loot_step(bot, snap, me, cfg):
+            farm_log(bot, "LOOT")
+            return
+
+        await bot.move(0, 0)
+        if await farm_cook_and_stack(bot, cfg):
+            return
+        if await farm_eat_step(bot, me, cfg):
+            return
+
+        # Idle: no prey in sight. Roam so we find the next spawn instead of
+        # standing on an empty field forever.
+        await farm_roam_step(bot, me, snap, cfg)
     return intent
+
+
+async def farm_heal_at(bot, me, healer, cfg):
+    """At the healer while retreating: drink if a potion helps, else use the
+    heal dialogue. Reuses the same option-picking handler as `heal`."""
+    target_hp = me["maxHp"] * cfg.heal_to_frac
+    if me["hp"] >= target_hp:
+        return
+    now = _now()
+    missing = me["maxHp"] - me["hp"]
+    if now - getattr(bot, "_heal_last_drink", 0.0) >= 0.8:
+        useful = [(bot.find_item(pid), amt) for pid, amt in HEAL_POTIONS
+                  if bot.find_item(pid) and missing >= amt * 0.5]
+        if useful:
+            potion, amt = useful[0]
+            bot._heal_last_drink = now
+            print(f"  drinking {potion['itemId']} (+{amt})")
+            await bot.use_item(potion["instanceId"])
+            return
+    if now - getattr(bot, "_farm_last_talk", 0.0) >= 3.0:
+        bot._farm_last_talk = now
+        bot._heal_npc = healer["id"]
+        print(f"  asking {healer.get('name')} for a heal "
+              f"({me['hp']}/{me['maxHp']})")
+        await bot.talk_to(healer["id"])
+
+
+async def farm_roam_step(bot, me, snap, cfg):
+    """No prey visible: drift to a new spot so spawns come back into view.
+
+    Picks a wander target, walks it, and re-picks on arrival or timeout. Without
+    this the bot parks on a cleared field and farms nothing."""
+    now = _now()
+    goal = getattr(bot, "_farm_roam_goal", None)
+    if (goal is None
+            or now - getattr(bot, "_farm_roam_since", 0.0) > 20.0
+            or dist_px(me["x"], me["y"], goal[0], goal[1]) <= TILE * 1.5):
+        import random
+        ang = random.uniform(0, 2 * math.pi)
+        r = random.uniform(cfg.roam_px * 0.4, cfg.roam_px)
+        goal = (me["x"] + math.cos(ang) * r, me["y"] + math.sin(ang) * r)
+        bot._farm_roam_goal = goal
+        bot._farm_roam_since = now
+    farm_log(bot, "ROAM (no prey in sight)")
+    await bot.move(*nav_step(bot, me, goal[0], goal[1]))
+
+
+def farm_log(bot, msg, period=5.0):
+    """Heartbeat: farming runs for hours, so print state on a timer rather than
+    at 10 Hz. Always prints when the state changes."""
+    now = _now()
+    state = msg.split()[0]
+    changed = state != getattr(bot, "_farm_state", None)
+    if changed or now - getattr(bot, "_farm_last_log", 0.0) >= period:
+        bot._farm_state = state
+        bot._farm_last_log = now
+        free, cap = bot.pack_space()
+        gold = bot.count_item("gold")
+        pack = f"  pack {cap-free}/{cap}" if cap else ""
+        fed = "" if bot.has_status("wellFed") else "  HUNGRY"
+        print(f"[farm] {msg}{pack}  gold={gold}{fed}")
 
 
 def make_send(raw):
