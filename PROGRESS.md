@@ -142,9 +142,52 @@ Resumes fighting only above `--resume-hp` (85%), not at the retreat line.
   mid-retreat).
 - **Loot ownership**: fresh drops carry `ownerId`/`ownerExpiresAt` reserving them
   for whoever earned the kill; we skip other people's rather than eat a refusal.
+- **Monsters drop a `corpse` CONTAINER, not loose items.** The drops are in its
+  `contents`; taking the corpse itself loots nothing. This is why the first live
+  run killed dozens of rats and collected nothing. `contents` is already in the
+  snapshot (the client's "open container" is pure UI, no round-trip), so we take
+  the inner items by their own instanceId — no open step needed.
+
+### The `.js` bundle is a moving target — maps MUST auto-refresh
+
+The surface collision map is **generated from the client bundle** (the server
+never sends terrain), so when the game redeploys, a pinned copy goes stale and
+bots path straight into trees the map thinks are open. That is exactly what
+happened: `index-5zRK5L7e.js` → `index-B5ZZen4-.js` moved a tree onto (61,37)
+and Sam pinned on it for two whole runs.
+
+The browser is immune because it always fetches the current bundle. We now match
+that: `avalon.py` calls `nav.refresh_maps_if_stale()` on every run, comparing the
+live bundle path from `index.html` against the `bundle` stamp written into
+`avalon_maps.json`, and re-extracts when they differ (`--no-map-check` to skip).
+`extract_z0.js` also now finds the worldgen loop by **structure, not minified
+names** — the old anchor `const Gh=8,xn=e=>e+Gh,ko=[]` became
+`const Qf=8,gn=e=>e+Qf,Ys=[]` and silently broke extraction.
 
 Flags: `--hunt`, `--retreat-hp`, `--resume-hp`, `--heal-to`, `--healer`,
-`--roam`, `--until-hp`, `--no-loot`, `--no-eat`, `--no-cook`, `--no-stack`.
+`--roam`, `--until-hp`, `--depth`, `--entry`, `--no-loot`, `--no-eat`,
+`--no-cook`, `--no-stack`.
+
+### Underground (`--depth`) — LIVE-VERIFIED
+```
+python avalon.py --account sam_altman farm --depth -1 --entry 58,22 --hunt "*"
+```
+Descends via the known holes, farms the floor, and climbs back out when hurt.
+**Safety property:** every down-hole has its up-ladder on the SAME tile, so the
+exit is always exactly where he landed (unit-tested for all of z=-1..-6).
+Underground the ESCAPE branch outranks the normal retreat — the ladder ends a
+fight outright, which beats trading blows on a floor with no healer.
+
+Floors (spawn tables, from the bundle):
+- **z=-1**: 30 caveBat + 10 orc — verified safe at lvl 3-4 (bats are 22 HP and
+  hit for 2; Sam hits for 14-16). He leveled 3 → 4 in one ~3 min run.
+- **z=-2**: 18 orc + 6 goblin + 6 caveBat + 1 orcZealot — orc-heavy, untested.
+- **z=-3**: 14 goblin + 4 caveBat — the goblins you wanted, untested.
+
+**Live run (z=-1, ~3 min): 0 deaths, 7 escapes, 10 loots, gold 23 → 32,
+levelled up.** Take z=-2/-3 one at a time and watch the first minutes: orcs are
+the unknown, and `--hunt goblin` would make him walk past them rather than
+through them.
 
 It **reports when the backpack fills** (`!! BACKPACK FULL`) and keeps farming
 without looting, and warns on `!! OUT OF FOOD` since that silently disables
