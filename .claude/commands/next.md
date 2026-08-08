@@ -66,7 +66,8 @@ the commit subject so the history links back:
 fix: split the eat/cook/stack selector (#1)
 ```
 
-Do not push unless the user asks.
+Push only if the repository's own guidance says to. Absent such a rule, leave the
+commit local and let the user push.
 
 ## 4. Close it out
 

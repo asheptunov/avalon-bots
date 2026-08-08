@@ -28,6 +28,28 @@ The bots drive a live third-party game server. There is no staging environment,
 so the test suite is the only thing standing between a refactor and a broken
 character in production. Treat a red suite as a hard stop.
 
+## Push when you are done
+
+**In this repo, push without asking.** This overrides the global rule that
+`git push` is opt-in — it applies here and nowhere else. Once the gate above
+passes and the work is committed, land it:
+
+```sh
+git pull --rebase && cd web && npm test && git push
+```
+
+Re-run the suite after the rebase, not just before it. A clean rebase can still
+produce a broken tree when someone else's commit touched the same code, and that
+is precisely the breakage worth catching before it reaches `origin/main`.
+
+**Stop and hand it back if the rebase conflicts.** Do not resolve conflicts to
+get the push through. Leave the rebase in progress or abort it, say which you
+did, and report what conflicted — a wrong resolution here ships a broken bot with
+no staging environment to catch it.
+
+Push to `main` triggers CI (`.github/workflows/ci.yml`) but does **not** publish
+a release. Releases fire only on a `v*` tag, so never push a tag unless asked.
+
 ## Backlog
 
 Work is queued as GitHub issues assigned to the repo owner, prioritized with the
