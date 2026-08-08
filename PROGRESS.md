@@ -8,6 +8,71 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## 2026-08-07 — depot banking, and two failure modes that were killing runs
+
+**The bot now banks.** When the pack fills it walks to the town depot, stows the
+haul, and goes back to farming — so a full bag is a round trip instead of the end
+of the run. `--no-bank` restores the old behaviour; `--bank-free N` sets how many
+slots trigger the trip. Live-verified on Sam: filled up 30 tiles out, walked in,
+deposited, resumed killing.
+
+### What the depot actually is
+Not the quest "chests" (`openChest`, one-time `chestClaimed`) — those are a
+different thing. The bank is the client's **depot**: six boxes in the town depot
+building, `openDepot {boxId}` → `depotUpdate {depot}`, where `depot` is an
+ordinary container with an `instanceId`. So depositing is the same `moveItem`
+into `{kind:'container', containerInstanceId}` that looting already used.
+
+| box | tile | stand on | note |
+|---|---|---|---|
+| depot-n1..n4 | 72/74/76/78, 39 | y+1 (south) | box tiles are BLOCKED |
+| depot-w1, w2 | 68, 43 / 68, 45 | x+1 (east) | |
+
+The depot building is a **sanctuary** (client safe-zone set is
+`["temple","depot"]`), so the trip is also the safest place on the map.
+
+**We keep the consumables.** Food and potions are held back (with a per-item
+reserve; surplus above it does get stowed). A bot that banks its last apple has
+banked its own HP regeneration — `wellFed` is the only thing that regenerates HP.
+
+### Three geometry traps, all paid for live
+1. **`tile * TILE`, never `(tile + 0.5) * TILE`.** The server maps px→tile with
+   `round()`, not `floor()`, so the half-tile form names the NEXT tile. The first
+   live run walked to 75,41 instead of 74,40, sat 2.2 tiles from the box, and got
+   "You are too far away" on every request.
+2. **Reach is measured from the BOX, not from the tile you walk to.** Arriving at
+   the standing tile is the goal; the range check has to be against the box.
+3. **A\* reports "arrived" from the tile ADJACENT to the goal** (`[0,0]`). Gating
+   the open on a tighter radius than A\* can deliver freezes the bot — it stands
+   still re-asking a pathfinder that has already finished. Treat `[0,0]` as the
+   signal to stop walking and start asking. Same trap `intents.js` documents.
+
+### Two live failure modes, fixed
+**Dario looped on a corpse, refused "too heavy to carry".** `bot.js` used to
+assert weight was flavour and slots were the real limit. **That was false** — the
+client says "Overloading stops you picking more up", and `playerStats` carries
+`carriedWeightOz`/`capacityOz` (Sam: 191/250). Now: `bot.overloaded()` stops us
+asking, and `handleLootRefusal` bans an item the server actually refused, because
+the proactive check knows our total weight but not what the next item weighs.
+Banking triggers on weight too — otherwise an overloaded bot with free slots
+never leaves.
+
+**Chasing a rat dropped him to z=-1 and he never came back.** A `walk`-mode
+teleport fires on *contact*, so A\* was happy to route a chase straight through
+one. Underground there are no rats, so he never fought, just looped looting while
+cave bats ate him — and nothing could climb back, because `descendStep` only runs
+when the configured depth is negative. Now `nav.trapdoorTiles(z)` makes the holes
+walls whenever we are not deliberately descending, and `climbStep` recovers if we
+end up on the wrong floor anyway.
+
+`where` now prints carried weight, which is usually the answer to "why isn't it
+looting?".
+
+226 tests (`test_depot.mjs`, `test_hazards.mjs` are new); the approach was also
+checked exhaustively from all 89 reachable tiles around the bank.
+
+---
+
 ## ⚠️ 2026-08-07 — ported to JavaScript; the Python stack is gone
 
 Everything below this banner describes the **Python** implementation, which has

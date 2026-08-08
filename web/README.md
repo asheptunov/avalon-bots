@@ -46,9 +46,23 @@ up new releases on its own check. Nothing is sent until you press Start.
 | resume above % | `--resume-hp` | resume fighting only above this |
 | loot drops | `--loot` | sweep corpses and loose drops |
 | eat / cook / stack | `--eat --cook --stack` | upkeep that makes long runs possible |
+| bank at depot when full | `--no-bank` to disable | walk to the town depot, stow the haul, come back |
 
 Retreat and resume are deliberately different numbers. That hysteresis is what
 stops a bot at the threshold oscillating between fleeing and swinging.
+
+### Banking
+
+A full backpack used to be the end of a run — the bot kept killing, but every
+drop past the last free slot was left on the ground. Now it walks to the **depot**
+(the town bank, a sanctuary at ~74,41 on z=0), deposits, and resumes. Food and
+potions are kept back: `wellFed` is the only thing that regenerates HP, so a bot
+that banks its last apple has banked its own healing.
+
+Both carry limits trigger a trip. Slots are the obvious one; **weight** is the one
+that bites on ore and armour, where the pack still shows free slots while the
+server refuses every pickup ("Overloading stops you picking more up"). `where`
+prints both.
 
 ## CLI
 
