@@ -122,19 +122,29 @@ test('the panel renders a separate tick box for each of eat, cook and stack', ()
 });
 
 test('the other toggles still map straight through', () => {
-  const { cfg } = configFrom({ loot: false, bank: false });
+  const { cfg } = configFrom({ loot: false, bank: false, courtesy: false });
   assert.equal(cfg.loot, false);
   assert.equal(cfg.bank, false);
-  const on = configFrom({ loot: true, bank: true }).cfg;
+  assert.equal(cfg.courtesy, false);
+  const on = configFrom({ loot: true, bank: true, courtesy: true }).cfg;
   assert.equal(on.loot, true);
   assert.equal(on.bank, true);
+  assert.equal(on.courtesy, true);
+});
+
+test('the panel offers the avoid-other-players switch, on by default', () => {
+  // Browser users have no CLI flags, so if the panel never renders this the
+  // behaviour is unreachable and unturnoffable from the only UI they have.
+  const src = readFileSync(new URL('../src/ui.js', import.meta.url), 'utf8');
+  assert.match(src, /<input id="courtesy" type="checkbox" checked>/,
+    'courtesy needs its own checkbox, ticked by default');
 });
 
 test('the built userscript carries the split checkboxes, not the merged one', () => {
   // The userscript is committed, so a rebuild that never happened would ship the
   // old single-checkbox panel to every installed user.
   const code = readFileSync(BUNDLE, 'utf8');
-  for (const id of ['eat', 'cook', 'stack']) {
+  for (const id of ['eat', 'cook', 'stack', 'courtesy']) {
     assert.match(code, new RegExp(`<input id="${id}" type="checkbox"`),
       `bundle is stale: no ${id} checkbox -- run \`node build.mjs\``);
   }

@@ -84,6 +84,8 @@ export function createPanel({ onStart, onStop }) {
         <input id="stack" type="checkbox" checked></div>
       <div class="row"><label for="bank">bank at depot when full</label>
         <input id="bank" type="checkbox" checked></div>
+      <div class="row"><label for="courtesy">avoid other players</label>
+        <input id="courtesy" type="checkbox" checked></div>
       <div class="row"><button id="go">Start</button></div>
       <div class="stat"><span>state</span><b id="s-state">idle</b></div>
       <div class="stat"><span>hp</span><b id="s-hp">–</b></div>
@@ -125,6 +127,10 @@ export function createPanel({ onStart, onStop }) {
       cook: $('cook').checked,
       stack: $('stack').checked,
       bank: $('bank').checked,
+      // Yield contested monsters and drops, and drift toward empty ground.
+      // Leave it on unless you know the field is yours -- it is what keeps the
+      // bot from looking like it is stealing kills.
+      courtesy: $('courtesy').checked,
     };
   }
 

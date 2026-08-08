@@ -552,6 +552,143 @@ test('the roam goal is stable between ticks -- no jitter', () => {
   assert.deepEqual(bot.run.farmRoamGoal, first, 'a re-rolled goal means it never arrives');
 });
 
+// ---- courtesy: staying out of other players' way ---------------------------
+//
+// The bots share a live server with humans. Every test here is about NOT doing
+// something -- not tagging their mob, not taking their drop -- which is exactly
+// the class of behaviour that has no in-game feedback and so goes unnoticed
+// until someone complains.
+
+/** Another player, at a tile. Same shape as me(), different id. */
+const other = (tile = [10, 10], id = 'them', name = 'Stranger') => ({
+  id, name, x: px(tile[0]), y: px(tile[1]), z: 0, hp: 100, maxHp: 100, level: 5,
+});
+
+test('a rat standing next to another player is left for them', () => {
+  const bot = new FakeBot(backpack([]));
+  // Their rat is ON them and 10 tiles from us: clearly theirs.
+  const snap = snapshot([me([10, 10]), other([20, 10])], [rat([20, 10])]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(bot.ofType('attack').length, 0, 'must not tag their monster');
+  assert.equal(stateOf(bot), 'ROAM', 'and should go find its own instead');
+});
+
+test('with courtesy off the same rat is fair game', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([20, 10])], [rat([20, 10])]);
+  run(bot, snap, { cook: false, stack: false, courtesy: false });
+  assert.ok(bot.ofType('move').length > 0, 'should chase it');
+  assert.equal(stateOf(bot), 'FIGHT');
+});
+
+test('a free rat is preferred over one next to another player', () => {
+  const bot = new FakeBot(backpack([]));
+  // Theirs is CLOSER to us than the free one, so only the claim rule can make
+  // the bot pick the far one.
+  const snap = snapshot(
+    [me([10, 10]), other([13, 10])],
+    [rat([13, 10], 20, 'theirs'), rat([22, 10], 20, 'free')]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(stateOf(bot), 'FIGHT');
+  // It is out of melee range, so we see a chase rather than an attack; prove the
+  // target by walking it in and checking who gets hit.
+  const closer = new FakeBot(backpack([]));
+  run(closer, snapshot(
+    [me([21, 10]), other([13, 10])],
+    [rat([13, 10], 20, 'theirs'), rat([21, 10], 20, 'free')]),
+  { cook: false, stack: false });
+  assert.equal(closer.ofType('attack')[0].targetId, 'free');
+});
+
+test('a rat we are already closest to stays ours even with a player nearby', () => {
+  // Otherwise a passer-by makes us abandon a half-killed monster: we lose the
+  // damage AND hand them a mob they never engaged.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([13, 10])], [rat([10, 10])]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'rat1');
+});
+
+test('a drop next to another player is not touched', () => {
+  const bot = new FakeBot(backpack([]));
+  // Underfoot for us AND next to them -- the tempting case. Theirs wins.
+  const snap = snapshot([me([10, 10]), other([12, 10])], [], [], [drop([10, 10])]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(bot.ofType('moveItem').length, 0, 'that is their kill\'s loot');
+});
+
+test('contested loot is skipped even when it is the only loot around', () => {
+  // Unlike a monster, loot has no "take it if there is nothing else" fallback:
+  // loot stealing is irreversible and the drop is not going anywhere.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([10, 10])], [], [],
+    [corpse([10, 10], [item('gold', 5, 'inner')])]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(bot.ofType('moveItem').length, 0);
+});
+
+test('with courtesy off contested loot is taken', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([12, 10])], [], [], [drop([10, 10])]);
+  run(bot, snap, { cook: false, stack: false, courtesy: false });
+  assert.ok(bot.ofType('moveItem').length > 0);
+});
+
+test('a far-off player claims nothing', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([60, 60])], [rat([10, 10])], [],
+    [drop([10, 10], 'gold', 5, 'g1')]);
+  run(bot, snap, { cook: false, stack: false });
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'rat1');
+});
+
+test('an ally by name is not a stranger to be avoided', () => {
+  // Two of our own characters on one field are cooperating. Without allyNames
+  // each would yield every monster to the other and the pair would farm nothing.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot(
+    [me([10, 10]), other([20, 10], 'buddy', 'Dario Amodei')],
+    [rat([20, 10])]);
+  run(bot, snap, { cook: false, stack: false, allyNames: ['dario'] });
+  assert.equal(stateOf(bot), 'FIGHT', 'our own escort claims nothing');
+});
+
+test('roaming heads away from the crowd, not into it', () => {
+  // Statistical, so it is run over many goals: with a player parked to our east
+  // the chosen goals should sit further from them than blind random would give.
+  const there = other([22, 10]);
+  let picked = 0; const n = 40;
+  for (let i = 0; i < n; i++) {
+    const bot = new FakeBot(backpack([]));
+    run(bot, snapshot([me([10, 10]), there], []), { cook: false, stack: false });
+    const g = bot.run.farmRoamGoal;
+    if (farm.distPx(g[0], g[1], there.x, there.y)
+        > farm.distPx(px(10), px(10), there.x, there.y)) picked++;
+  }
+  assert.ok(picked > n * 0.7,
+    `only ${picked}/${n} roam goals moved away from the other player`);
+});
+
+test('claimedMonsters ignores corpses and blames the nearest player', () => {
+  const them = other([20, 10]);
+  const snap = snapshot([me([10, 10]), them],
+    [rat([20, 10], 20, 'live'), rat([20, 11], 0, 'dead')]);
+  const claimed = farm.claimedMonsters(snap, me([10, 10]), [them]);
+  assert.ok(claimed.has('live'));
+  assert.ok(!claimed.has('dead'), 'a dead monster is nobody\'s kill to steal');
+});
+
+test('otherPlayers excludes us and our allies', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([
+    me([10, 10]),
+    other([20, 10], 'a', 'Dario Amodei'),
+    other([21, 10], 'b', 'Stranger'),
+  ]);
+  const got = farm.otherPlayers(bot, snap, { allyNames: ['dario'] });
+  assert.deepEqual(got.map((p) => p.id), ['b']);
+});
+
 // ---- inventory helpers -----------------------------------------------------
 
 test('groundItems null means "unchanged", not "the floor is empty"', () => {

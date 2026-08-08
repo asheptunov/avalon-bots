@@ -49,6 +49,7 @@ up new releases on its own check. Nothing is sent until you press Start.
 | cook raw meat | `--no-cook` to disable | raw meat is worth far more cooked |
 | merge stacks | `--no-stack` to disable | pour split stacks together to free pack slots |
 | bank at depot when full | `--no-bank` to disable | walk to the town depot, stow the haul, come back |
+| avoid other players | `--no-courtesy` to disable | don't tag their monsters or take their drops |
 
 Retreat and resume are deliberately different numbers. That hysteresis is what
 stops a bot at the threshold oscillating between fleeing and swinging.
@@ -65,6 +66,30 @@ Both carry limits trigger a trip. Slots are the obvious one; **weight** is the o
 that bites on ore and armour, where the pack still shows free slots while the
 server refuses every pickup ("Overloading stops you picking more up"). `where`
 prints both.
+
+### Staying out of other players' way
+
+This is a live server with real people on it, and an untiring bot that tags the
+monster someone is walking toward — or hoovers the drops off their kill — is
+indistinguishable from a griefer. Courtesy is **on by default**:
+
+- A monster with another player within ~6 tiles, *closer to it than we are*, is
+  theirs. The bot drops the target and roams off to find its own. The
+  "closer than we are" half is deliberate: a passer-by must not make us abandon a
+  half-killed monster, which would waste our damage and hand them a mob they
+  never engaged.
+- A drop within ~5 tiles of another player is theirs, with no fallback. Unlike a
+  monster, loot stealing is irreversible and the drop is not going anywhere, so
+  leaving it is always the right call.
+- With nobody else around it costs nothing — every check short-circuits on an
+  empty player list.
+- When there *is* somebody, roaming samples several directions and takes the one
+  landing furthest from them, so the bot drifts out of a busy area on its own
+  rather than waiting to be told each monster is spoken for.
+
+`--allies alice,bob` marks other characters as **ours**, so a pair of your own
+bots on one field don't each politely yield every monster to the other and farm
+nothing. (The swarm has its own targeting and is unaffected.)
 
 ## CLI
 

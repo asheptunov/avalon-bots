@@ -97,15 +97,101 @@ export function nearestTo(xs, anchor) {
   return best;
 }
 
-export function nearestHuntable(snap, anchor, huntTypes) {
+/**
+ * The nearest live monster we are willing to hunt.
+ *
+ * `claimed` (from claimedMonsters) demotes rather than hides: an unclaimed
+ * monster always wins, but a claimed one is still returned when it is all there
+ * is, so the caller can decide. The farm loop chooses to walk away; the caller
+ * needs to be able to tell the difference, hence the demotion instead of a
+ * filter.
+ */
+export function nearestHuntable(snap, anchor, huntTypes, claimed = null) {
   let best = null; let bestD = Infinity;
+  let fallback = null; let fallbackD = Infinity;
   for (const m of snap.monsters) {
     if (m.hp <= 0) continue;
     if (huntTypes && !huntTypes.includes(m.monsterType)) continue;
     const d = distPx(m.x, m.y, anchor.x, anchor.y);
+    if (claimed && claimed.has(m.id)) {
+      if (d < fallbackD) { fallbackD = d; fallback = m; }
+      continue;
+    }
     if (d < bestD) { bestD = d; best = m; }
   }
-  return best;
+  return best || fallback;
+}
+
+// ---- courtesy: stay out of other players' way ------------------------------
+//
+// The bots share a live server with humans, and a bot that wanders into someone
+// else's grind spot looks exactly like a griefer: it tags their mobs, it hoovers
+// their drops, and it does so tirelessly. None of that is worth a single extra
+// kill per hour, so the rule is prophylactic -- prefer empty ground, and when a
+// contested target is the only option, take it only because there is no other.
+//
+// The radii are deliberately generous. Being wrong in the polite direction costs
+// a few seconds of walking; being wrong the other way costs someone their spot.
+
+// A monster this close to another player is treated as theirs.
+const CLAIM_PX = TILE * 6;
+// Loot this close to another player is theirs, full stop -- see lootIsContested.
+const LOOT_CLAIM_PX = TILE * 5;
+// Players within this of a roam goal make it a bad place to head for.
+const CROWD_PX = TILE * 10;
+
+/**
+ * Players who are not us and not on our side.
+ *
+ * `cfg.allyNames` is how the swarm keeps its own escorts off this list: two of
+ * our characters farming the same field are cooperating, not competing, and
+ * treating a party member as a stranger would make the pack refuse to fight
+ * anything at all.
+ */
+export function otherPlayers(bot, snap, cfg = null) {
+  const allies = cfg?.allyNames || [];
+  const out = [];
+  for (const p of snap.players) {
+    if (p.id === bot.me) continue;
+    if (allies.some((a) => nameMatches(a, p.name))) continue;
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * The ids of monsters that belong to somebody else: another player is within
+ * CLAIM_PX of them, and is closer to them than we are.
+ *
+ * The "and is closer" half matters. Without it, a player walking past our fight
+ * would un-claim nothing but would claim the rat we are already mid-swing on,
+ * and we would drop the target and walk away from a half-killed monster --
+ * wasting the damage and leaving them a mob they did not ask for.
+ */
+export function claimedMonsters(snap, me, others) {
+  const claimed = new Set();
+  if (!others.length) return claimed;
+  for (const m of snap.monsters) {
+    if (m.hp <= 0) continue;
+    const mine = distPx(m.x, m.y, me.x, me.y);
+    for (const p of others) {
+      const theirs = distPx(m.x, m.y, p.x, p.y);
+      if (theirs <= CLAIM_PX && theirs < mine) { claimed.add(m.id); break; }
+    }
+  }
+  return claimed;
+}
+
+/**
+ * True if this ground entry is close enough to another player to be their kill's
+ * drop.
+ *
+ * Unlike monsters this has no "unless there is nothing else" escape hatch, and
+ * no proximity comparison: loot stealing is the more offensive of the two, it is
+ * irreversible, and the loot is not going anywhere. Leaving it is always fine.
+ */
+export function lootIsContested(where, others) {
+  return others.some((p) => distPx(where.x, where.y, p.x, p.y) <= LOOT_CLAIM_PX);
 }
 
 // HP-restoring potions, smallest first (bundle: healthPotion 30, large 60).
@@ -226,9 +312,10 @@ export function* lootCandidates(bot, snap) {
  * and the callers all want both answers. Returning only the winner meant the
  * caller re-derived the distance and, worse, ran the whole scan a second time.
  */
-function nearestLoot(bot, snap, me) {
+function nearestLoot(bot, snap, me, others = null) {
   let best = null; let bestD = Infinity;
   for (const c of lootCandidates(bot, snap)) {
+    if (others && others.length && lootIsContested(c[0], others)) continue;
     const d = distPx(c[0].x, c[0].y, me.x, me.y);
     if (d < bestD) { bestD = d; best = c; }
   }
@@ -310,6 +397,13 @@ export class FarmConfig {
     this.bank = o.bank ?? true;
     // Leave for the bank with this many slots still free -- see shouldBank.
     this.bankFreeSlots = o.bankFreeSlots ?? 1;
+    // Stay out of other players' way: don't tag their monsters, don't touch
+    // their drops, drift toward free ground. On by default -- this is a shared
+    // live server and looking like a griefer is not a tradeoff worth making.
+    this.courtesy = o.courtesy ?? true;
+    // Player names that are OURS, so the swarm doesn't treat its own escorts as
+    // strangers to be avoided.
+    this.allyNames = o.allyNames ?? [];
   }
 }
 
@@ -645,19 +739,54 @@ export function handleDialogue(bot, msg, log) {
   return true;
 }
 
-/** No prey visible: drift so spawns come back into view. */
-function roamStep(bot, me, cfg, log) {
+// How many roam goals to sample before settling for the least bad one. Small on
+// purpose: this runs on the tick that picks a new goal, and 'roughly away from
+// the crowd' is all the precision this needs.
+const ROAM_CANDIDATES = 8;
+
+/**
+ * Score a prospective roam goal: how far the nearest other player would be,
+ * capped at CROWD_PX because past that they are simply not a factor and we would
+ * rather not have the bot flee to the map edge to maximise a number.
+ */
+function roamClearance(goal, others) {
+  let worst = CROWD_PX;
+  for (const p of others) {
+    const d = distPx(goal[0], goal[1], p.x, p.y);
+    if (d < worst) worst = d;
+  }
+  return worst;
+}
+
+/**
+ * No prey visible: drift so spawns come back into view -- preferring open ground.
+ *
+ * With other players about we sample a handful of directions and take the one
+ * that lands furthest from them, instead of the first random angle. That is the
+ * prophylactic half of the courtesy rule: the bot drifts out of a busy area on
+ * its own rather than waiting to be told a specific monster is spoken for.
+ */
+function roamStep(bot, me, cfg, log, others = []) {
   const t = now();
   let goal = bot.run.farmRoamGoal;
   if (!goal || since(bot, 'farmRoamSince') > 20.0
       || distPx(me.x, me.y, goal[0], goal[1]) <= TILE * 1.5) {
-    const ang = Math.random() * 2 * Math.PI;
-    const r = cfg.roamPx * (0.4 + Math.random() * 0.6);
-    goal = [me.x + Math.cos(ang) * r, me.y + Math.sin(ang) * r];
+    let best = null; let bestScore = -Infinity;
+    const tries = others.length ? ROAM_CANDIDATES : 1;
+    for (let i = 0; i < tries; i++) {
+      const ang = Math.random() * 2 * Math.PI;
+      const r = cfg.roamPx * (0.4 + Math.random() * 0.6);
+      const cand = [me.x + Math.cos(ang) * r, me.y + Math.sin(ang) * r];
+      const score = others.length ? roamClearance(cand, others) : 0;
+      if (score > bestScore) { bestScore = score; best = cand; }
+    }
+    goal = best;
     bot.run.farmRoamGoal = goal;
     bot.run.farmRoamSince = t;
   }
-  farmLog(bot, 'ROAM', () => '(no prey in sight)', log);
+  farmLog(bot, 'ROAM',
+    () => (others.length ? '(no free prey in sight -- drifting off the crowd)'
+      : '(no prey in sight)'), log);
   bot.move(...navStep(bot, me, goal[0], goal[1]));
 }
 
@@ -765,14 +894,30 @@ export function makeFarm(cfg, log) {
     // --- travel to the target floor, only when healthy -------------------
     if (cfg.depth < 0 && descendStep(bot, me, cfg, log)) return;
 
+    // --- who else is here -------------------------------------------------
+    // Resolved once for the tick: prey selection, looting and roaming all need
+    // the same answer, and each of them scans every player otherwise.
+    const others = cfg.courtesy ? otherPlayers(bot, snap, cfg) : [];
+    const claimed = others.length ? claimedMonsters(snap, me, others) : null;
+
     // --- grab loot at our feet before moving on --------------------------
     // Loot used to sit behind the fight branch, so on a field that always has
     // another rat in view he never stopped to collect and left every corpse
     // behind. A monster already in melee still comes first.
-    const m = nearestHuntable(snap, me, cfg.huntTypes);
+    let m = nearestHuntable(snap, me, cfg.huntTypes, claimed);
+    // Everything in view is somebody else's. Walking away to find our own spawns
+    // is a real alternative -- and the issue's rule is that a viable alternative
+    // always beats muscling in -- so drop the target and let ROAM take us out of
+    // their area. Not applied to something already on us: `claimed` excludes
+    // monsters we are closer to, so a mob in our face is ours to finish.
+    if (m && claimed && claimed.has(m.id)) {
+      farmLog(bot, 'YIELD',
+        () => `${m.monsterType} is another player's -- moving on`, log);
+      m = null;
+    }
     const engaged = m && distPx(m.x, m.y, me.x, me.y) < MELEE_RANGE_PX;
     // One ground scan for the whole tick, reused by both loot branches below.
-    const loot = cfg.loot ? nearestLoot(bot, snap, me) : null;
+    const loot = cfg.loot ? nearestLoot(bot, snap, me, others) : null;
     if (loot && !engaged && loot.dist <= cfg.lootPx) {
       if (lootStep(bot, snap, me, log, loot)) {
         farmLog(bot, 'LOOT', null, log);
@@ -804,6 +949,6 @@ export function makeFarm(cfg, log) {
       return;
     }
 
-    roamStep(bot, me, cfg, log);
+    roamStep(bot, me, cfg, log, others);
   };
 }
