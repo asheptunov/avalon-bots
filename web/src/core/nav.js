@@ -28,6 +28,7 @@ export function loadMaps(raw) {
     MAPS.set(parseInt(zk, 10), {
       w: zn.widthTiles, h: zn.heightTiles, rows: zn.rows,
       teleports: zn.teleports || [],
+      spawns: zn.spawns || [],
     });
   }
   return MAPS;
@@ -42,6 +43,94 @@ export function teleports(z) {
   return m ? m.teleports : [];
 }
 
+export function spawns(z) {
+  const m = MAPS?.get(Number(z));
+  return m ? m.spawns : [];
+}
+
+/** Every z-level we have a map for, surface first then deeper. */
+export function knownDepths() {
+  return MAPS ? [...MAPS.keys()].sort((a, b) => b - a) : [];
+}
+
+/**
+ * How far a farm spot's monsters roam. A spawn's `leashTiles` is the radius the
+ * monster wanders in, so two spawns within this of each other feed one spot.
+ */
+const CLUSTER_TILES = 12;
+
+// A spot must be reachable, and a spawn sitting inside a wall (or one whose tile
+// the worldgen later built over) is not somewhere we can stand and fight.
+const SPAWN_SNAP_RADIUS = 4;
+
+/**
+ * Where to go to hunt `types`: the spawn clusters for those monsters, richest
+ * first, as `{z, tile, count, spawns}`.
+ *
+ * Clustered rather than returned raw because a single spawn point is a poor
+ * target -- one monster on a 5-tile leash is a few seconds of farming and then
+ * a respawn wait. Concentrations are what make a spot worth walking to, and the
+ * bundle's own layout obliges: cave bats come in caves of a dozen, not singly.
+ *
+ * `nightOnly` spawns (the wraiths) are excluded by default: they are simply not
+ * there in daylight, so a cluster of them is an empty room to walk to. Pass
+ * `night: true` to include them.
+ *
+ * Ranked by count DISCOUNTED for depth, not by raw count. Depth is danger and
+ * distance in this game, and the two are not close to commensurate: the richest
+ * cave-bat cluster in the bundle is on z=-4, through hell and past two bosses,
+ * while z=-1 has a dozen rooms nearly as good one ladder from town. Ranking on
+ * count alone marches a starting character into the hell floors to gain one
+ * extra spawn, so each floor down costs a fixed fraction of the spot's value.
+ */
+export function huntingGrounds(types = null, { night = false } = {}) {
+  const want = types && types.length ? new Set(types) : null;
+  const out = [];
+  for (const z of knownDepths()) {
+    const here = spawns(z).filter((s) =>
+      (!want || want.has(s.monsterType)) && (night || !s.nightOnly));
+    // Greedy single-pass clustering: seed on a spawn, absorb every other spawn
+    // within CLUSTER_TILES, repeat. Good enough for a table of 155 points, and
+    // it keeps the richest room together, which is the only property we need.
+    const taken = new Set();
+    for (const seed of here) {
+      if (taken.has(seed.id)) continue;
+      const group = [];
+      for (const s of here) {
+        if (taken.has(s.id)) continue;
+        if (Math.hypot(s.tile[0] - seed.tile[0], s.tile[1] - seed.tile[1]) > CLUSTER_TILES) {
+          continue;
+        }
+        taken.add(s.id);
+        group.push(s);
+      }
+      // Aim at the group's centre of mass, then snap it onto open ground: the
+      // middle of a ring of spawns can easily be the rock they are arranged
+      // around, and an unreachable goal makes A* fail every tick.
+      const cx = Math.round(group.reduce((a, s) => a + s.tile[0], 0) / group.length);
+      const cy = Math.round(group.reduce((a, s) => a + s.tile[1], 0) / group.length);
+      const tile = nearestWalkable(z, cx, cy, new Set(), SPAWN_SNAP_RADIUS)
+        // Fall back to a spawn's own tile, which the monster stands on and so is
+        // walkable by construction.
+        || seed.tile;
+      out.push({ z, tile, count: group.length, spawns: group });
+    }
+  }
+  out.sort((a, b) => spotValue(b) - spotValue(a) || b.z - a.z);
+  return out;
+}
+
+// What one floor of descent costs a spot, as a fraction of its value. At 0.55 a
+// cluster must be nearly twice as rich to justify each extra floor -- which is
+// what keeps a caveBat hunt on z=-1 (3 spawns, one ladder from town) instead of
+// z=-4 (5 spawns, through hell).
+const DEPTH_DISCOUNT = 0.55;
+
+/** A cluster's worth: spawn count, discounted for how deep you must go. */
+export function spotValue(spot) {
+  return spot.count * DEPTH_DISCOUNT ** -spot.z;
+}
+
 /** Nearest teleport on `z` leading to `toZ`, optionally filtered by mode. */
 export function nearestTeleport(z, toZ, fromTile, mode = null) {
   const cands = teleports(z).filter(
@@ -52,6 +141,47 @@ export function nearestTeleport(z, toZ, fromTile, mode = null) {
     const d = (t.fromTile[0] - fx) ** 2 + (t.fromTile[1] - fy) ** 2;
     return best && best.d <= d ? best : { d, t };
   }, null).t;
+}
+
+/**
+ * The teleport from `z` to `toZ` that best trades the walk to it against the
+ * walk from where it lands to `goalTile`.
+ *
+ * Reachability is checked, not assumed, and that is the load-bearing part rather
+ * than a refinement. The underground floors are NOT connected regions: z=-1 holds
+ * a bat cave around the 58,22 entrance and a separate orc den reachable only
+ * through the hole at 20,78, with no path between them. Ranking holes by
+ * straight-line distance alone picks the nearest one and hands A* a goal it can
+ * never reach -- the bot then walks to the wrong cave and roams there, which is
+ * the same symptom as the bug this whole feature exists to fix.
+ *
+ * So candidates that cannot actually reach the goal are dropped, and only among
+ * the rest does distance decide. The A* runs are the price; this is called once
+ * when a route is chosen, not on every tick.
+ */
+export function bestTeleportToward(z, toZ, fromTile, goalTile) {
+  const cands = teleports(z).filter((t) => t.toZ === toZ);
+  if (!cands.length) return null;
+  const [fx, fy] = fromTile;
+  const [gx, gy] = goalTile;
+  let best = null; let bestCost = Infinity;
+  let fallback = null; let fallbackCost = Infinity;
+  for (const t of cands) {
+    const walkTo = Math.hypot(t.fromTile[0] - fx, t.fromTile[1] - fy);
+    // Where it PUTS us, which is toTile -- not the tile we step on to use it.
+    const [lx, ly] = t.toTile || t.fromTile;
+    const cost = walkTo + Math.hypot(lx - gx, ly - gy);
+    // Can we get from where this hole drops us to the prey at all?
+    const connected = (lx === gx && ly === gy)
+      || findPath(toZ, [lx, ly], goalTile, null).length > 0;
+    if (connected) {
+      if (cost < bestCost) { bestCost = cost; best = t; }
+    } else if (cost < fallbackCost) { fallbackCost = cost; fallback = t; }
+  }
+  // Every hole failed the check -- take the nearest by distance rather than
+  // refusing to descend. A missing map or an A* budget overrun must not strand
+  // the bot on the surface.
+  return best || fallback;
 }
 
 /**

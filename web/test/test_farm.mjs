@@ -707,3 +707,168 @@ test('packSpace counts free slots', () => {
 test('packSpace with no backpack is [0, 0]', () => {
   assert.deepEqual(new FakeBot({}).packSpace(), [0, 0]);
 });
+
+// ---- travel: go where the prey actually lives ------------------------------
+//
+// The bug this fixes, verbatim from the issue: "when i'm on floor 0 and i farm
+// cave bats, it just gets stuck roaming not knowing what to do." Every cave bat
+// in the game spawns underground, and nothing ever told the bot to go down --
+// cfg.depth was 0, descendStep is gated on depth < 0, so it roamed the surface
+// forever looking for a monster that does not spawn there.
+//
+// These use the REAL extracted spawn table (maps.json, loaded at the top of this
+// file), because the behaviour being tested is "does it know where cave bats
+// live" -- and a synthetic world would prove only that the plumbing runs.
+
+test('hunting cave bats on the surface heads for the hole instead of roaming', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  run(bot, snapshot([me([58, 26])], []), { huntTypes: ['caveBat'] });
+  assert.equal(stateOf(bot), 'DESCEND',
+    'cave bats are underground, so the trip starts by going down -- not ROAM');
+  assert.ok(bot.ofType('move').length > 0, 'and it actually walks');
+});
+
+// The regression guard proper: ROAM is exactly the wrong answer here, and it is
+// what the bot did before this existed.
+test('a surface caveBat hunt never settles for roaming the surface', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  for (let i = 0; i < 5; i++) run(bot, snapshot([me([58, 26])], []), { huntTypes: ['caveBat'] });
+  assert.notEqual(stateOf(bot), 'ROAM',
+    'roaming a floor with no cave bats on it is the bug being fixed');
+});
+
+test('the spot it picks for cave bats is underground, and it is where it aims', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  const c = cfg({ huntTypes: ['caveBat'] });
+  const spot = farm.huntSpot(bot, c);
+  assert.ok(spot, 'the spawn table knows where cave bats are');
+  assert.ok(spot.z < 0, `cave bats live underground, got z=${spot.z}`);
+  assert.ok(nav.walkable(spot.z, spot.tile[0], spot.tile[1]),
+    'and the destination is ground we can stand on');
+});
+
+// Rats DO spawn on the surface, so a rat hunt must not wander off looking for a
+// better field -- the travel logic has to be a no-op when we are already right.
+test('hunting rats on the surface stays put and fights', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  const spot = farm.huntSpot(bot, cfg({ huntTypes: ['rat'] }));
+  assert.equal(spot.z, 0, 'rats are a surface monster');
+  // Standing right at the spot with a rat in reach: it fights, it does not travel.
+  const snap = snapshot([me(spot.tile)], [rat(spot.tile, 20)]);
+  run(bot, snap, { huntTypes: ['rat'] });
+  assert.ok(bot.ofType('attack').length > 0, 'prey in reach is fought, not walked past');
+});
+
+// A monster in view beats the nominal centre of the spot. Otherwise the bot
+// shoves through a room full of prey to stand on one particular tile.
+test('prey in view interrupts the walk to the spot', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = -1;
+  const spot = farm.huntSpot(bot, cfg({ huntTypes: ['caveBat'] }));
+  // Far from the spot, but with a bat right next to us.
+  const here = [spot.tile[0] + 30, spot.tile[1] + 30];
+  const snap = snapshot([me(here)], [rat(here, 20, 'b1', 'caveBat')]);
+  snap.z = -1;
+  run(bot, snap, { huntTypes: ['caveBat'] });
+  assert.ok(bot.ofType('attack').length > 0,
+    'a bat in melee is killed now, not after a 40-tile walk');
+});
+
+// An explicit --depth is the caller naming a floor. Overriding it would ignore
+// them, and would break every existing depth test's intent.
+test('an explicit depth turns travel off and is obeyed', () => {
+  assert.equal(new farm.FarmConfig({ depth: -1 }).travel, false,
+    '--depth means "farm this floor"');
+  assert.equal(new farm.FarmConfig({}).travel, true,
+    'with no depth given, going to the prey is the default');
+  assert.equal(new farm.FarmConfig({ travel: false }).travel, false,
+    'and it can be switched off outright');
+});
+
+test('with travel off a surface caveBat hunt roams, exactly as it used to', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  run(bot, snapshot([me([50, 50])], []), { huntTypes: ['caveBat'], travel: false });
+  assert.equal(stateOf(bot), 'ROAM', 'opting out restores the old behaviour');
+});
+
+// "(anything)" in the UI means hunt whatever is here; every floor has something,
+// so there is nowhere better to be.
+test('hunting anything picks no spot and just farms where it stands', () => {
+  const bot = new FakeBot(backpack([]));
+  assert.equal(farm.huntSpot(bot, cfg({ huntTypes: null })), null);
+});
+
+// ghost is in MONSTER_TYPES but has no spawn point anywhere in the bundle. The
+// honest answer is to farm where we are, not to walk somewhere arbitrary.
+test('a monster that spawns nowhere degrades to farming in place', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  assert.equal(farm.huntSpot(bot, cfg({ huntTypes: ['ghost'] })), null);
+  run(bot, snapshot([me([50, 50])], []), { huntTypes: ['ghost'] });
+  assert.equal(stateOf(bot), 'ROAM', 'no spawns known -> roam, rather than freeze');
+});
+
+// The spot must not be re-chosen mid-walk: two clusters of equal value would have
+// the bot oscillate between them and never arrive at either.
+test('the chosen spot is stable across ticks', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  const c = cfg({ huntTypes: ['caveBat'] });
+  const first = farm.huntSpot(bot, c);
+  for (let i = 0; i < 20; i++) {
+    assert.deepEqual(farm.huntSpot(bot, c), first, 'the destination does not drift');
+  }
+});
+
+// A hurt bot heals before travelling: the trip can cross a floor or two, and
+// starting it at 20% HP walks a nearly-dead character past everything.
+test('a hurt bot retreats rather than starting the trip', () => {
+  const aldric = { id: 'n1', npcType: 'healer', name: 'Brother Aldric', x: px(20), y: px(10), z: 0 };
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  run(bot, snapshot([me([50, 30], 20)], [], [aldric]), { huntTypes: ['caveBat'] });
+  assert.equal(stateOf(bot), 'RETREAT', 'heal first, travel after');
+});
+
+// Travelling underground must not make the bot treat the hole it needs as a wall.
+// setNavObstacles blocks trapdoors unless we MEAN to descend, and it reads
+// cfg.depth -- which travelStep sets. Resolving the spot after that ran would
+// route A* around the very hole the trip depends on.
+test('the trapdoor to the target floor is not treated as a wall', () => {
+  const bot = new FakeBot(backpack([]));
+  bot.z = 0;
+  run(bot, snapshot([me([58, 26])], []), { huntTypes: ['caveBat'] });
+  const holeKey = nav.tileKey(HOLE[0], HOLE[1]);
+  assert.ok(!bot.run.occupied.has(holeKey),
+    'the hole we are travelling to must stay open to the pathfinder');
+});
+
+// Banking is a surface-only trip -- bankStep declines every tick off z=0, since
+// there is no depot underground. Latching `banking` down there therefore sets it
+// for good: the bot farms on with a full pack while permanently believing it is on
+// a bank run, and the real trip never happens once it climbs out. Harmless while
+// only --depth put bots underground; now that travel routes them there by default
+// it is the normal case.
+test('a full pack underground does not latch a bank trip that cannot run', () => {
+  const bot = new FakeBot(backpack(
+    Array.from({ length: 8 }, (_, i) => item('emberOre', 1, `ore${i}`))));
+  bot.z = -1;
+  const snap = snapshot([me([68, 16])], []);
+  snap.z = -1;
+  run(bot, snap, { huntTypes: ['caveBat'] });
+  assert.ok(!bot.run.banking,
+    'no depot down here, so the trip must not be latched until we surface');
+});
+
+test('a full pack on the surface still banks', () => {
+  const bot = new FakeBot(backpack(
+    Array.from({ length: 8 }, (_, i) => item('emberOre', 1, `ore${i}`))));
+  bot.z = 0;
+  run(bot, snapshot([me([74, 41])], []), { huntTypes: ['rat'] });
+  assert.ok(bot.run.banking, 'the depot is right here -- go and use it');
+});

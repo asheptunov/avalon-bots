@@ -9,7 +9,7 @@ import { installHook, makeSender } from './transport/browser.js';
 import { extractFromPage } from './transport/pagemaps.js';
 import { AvalonBot } from './core/bot.js';
 import {
-  makeFarm, FarmConfig, meOf, handleDialogue, handleLootRefusal,
+  makeFarm, FarmConfig, meOf, handleDialogue, handleLootRefusal, huntSpot,
 } from './core/farm.js';
 import { handleDepot, endBanking } from './core/depot.js';
 import * as nav from './core/nav.js';
@@ -121,9 +121,21 @@ function boot() {
     bot.run = {};
     bot.fleeing = false;
     bot.done = false;
-    intent = makeFarm(new FarmConfig(opts), log);
+    const cfg = new FarmConfig(opts);
+    intent = makeFarm(cfg, log);
     panel.setRunning(true);
     log(`started -- hunting ${opts.huntTypes ? opts.huntTypes.join(',') : 'anything'}`);
+    // Say where we are going, and say so BEFORE walking. A bot that silently
+    // heads for a ladder looks broken; naming the destination (or admitting the
+    // monster spawns nowhere) is what makes the trip legible.
+    if (cfg.travel && cfg.huntTypes) {
+      const spot = huntSpot(bot, cfg);
+      if (spot) {
+        log(`${cfg.huntTypes.join('/')} live on z${spot.z} @${spot.tile} -- heading there`);
+      } else {
+        log(`!! no known ${cfg.huntTypes.join('/')} spawns -- farming wherever we are`);
+      }
+    }
   }
 
   function stop() {

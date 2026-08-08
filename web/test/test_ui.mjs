@@ -151,3 +151,29 @@ test('the built userscript carries the split checkboxes, not the merged one', ()
   assert.doesNotMatch(code, /eat \/ cook \/ stack/,
     'bundle is stale: still shows the merged eat/cook/stack label');
 });
+
+// ---- travel to the monster's area -----------------------------------------
+//
+// The panel is where the reported bug was actually hit: a browser user picks
+// "caveBat", presses Start, and the bot roams the surface forever because every
+// cave bat spawns underground. The panel had no way to express "go there", and
+// the config it built left FarmConfig.travel to its default.
+
+test('the travel switch maps through to the config', () => {
+  assert.equal(configFrom({ travel: false }).cfg.travel, false);
+  assert.equal(configFrom({ travel: true }).cfg.travel, true);
+});
+
+test('the panel offers the go-to-the-monster switch, on by default', () => {
+  // On by default is the fix: the reported bug is what happens with it off, and
+  // a browser user has no flag to turn it on.
+  const src = readFileSync(new URL('../src/ui.js', import.meta.url), 'utf8');
+  assert.match(src, /<input id="travel" type="checkbox" checked>/,
+    'travel needs its own checkbox, ticked by default');
+});
+
+test('the built userscript carries the travel checkbox', () => {
+  const code = readFileSync(BUNDLE, 'utf8');
+  assert.match(code, /<input id="travel" type="checkbox"/,
+    'bundle is stale: no travel checkbox -- run `node build.mjs`');
+});

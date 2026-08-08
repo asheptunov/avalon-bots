@@ -57,6 +57,8 @@ Commands:
   move      walk to 'x,y', a location, or a player, then exit
   send      send one raw JSON message, then exit
   maps      re-extract collision maps from the live client
+  spots     print the best hunting grounds for a monster, then exit
+              (spots --hunt caveBat [--night] [--top 10]; needs no login)
   lead      run as the bot leader of a party
   escort    follow a leader (bot or human) as one escort
   swarm     run the WHOLE hive from this one process
@@ -73,8 +75,10 @@ farm flags:
   --heal-to <pct>      heal to this at the healer             (default 95)
   --healer <name>      NPC to heal at ('' = just back off)    (default aldric)
   --roam <tiles>       how far to wander for the next spawn   (default 12)
-  --depth <z>          0 = surface, negative = underground    (default 0)
+  --depth <z>          farm THIS floor, no travel  (default: go where prey is)
   --entry <x,y>        which hole to descend by
+  --no-travel          stay on this floor instead of walking to the prey
+  --night              include night-only spawns (wraiths) when picking a spot
   --until-hp <pct>     stop once HP drops to this
   --no-loot --no-eat --no-cook --no-stack --no-bank
   --bank-free <n>      head to the depot with this many slots left (default 1)
@@ -231,6 +235,11 @@ async function cmdFarm(args) {
     untilHpFrac: args['until-hp'] ? num(args['until-hp']) / 100 : null,
     depth: num(args.depth, 0),
     entryTile: entry,
+    // Travel to where the hunted monster lives. Naming --depth means the caller
+    // has chosen a floor, so honour that and stay put; --no-travel turns it off
+    // outright.
+    travel: !args['no-travel'] && args.depth === undefined,
+    night: !!args.night,
     loot: !args['no-loot'],
     eat: !args['no-eat'],
     cook: !args['no-cook'],
@@ -526,6 +535,33 @@ async function cmdSwarm(args) {
   if (args.duration) setTimeout(shutdown, Number(args.duration) * 1000);
 }
 
+/**
+ * Print where the bot would go to hunt something -- the spawn table's own answer,
+ * ranked exactly as the farm loop ranks it.
+ *
+ * Exists because the alternative way to check "will it find the cave bats" is to
+ * run a live bot and watch it for a few minutes.
+ */
+async function cmdSpots(args) {
+  await ensureMaps(true);
+  const hunt = args.hunt === undefined ? null : String(args.hunt);
+  const types = !hunt || hunt === '*' ? null : hunt.split(',');
+  const grounds = nav.huntingGrounds(types, { night: !!args.night });
+  if (!grounds.length) {
+    console.log(`no spawns for ${types ? types.join('/') : 'anything'}`
+      + (args.night ? '' : ' (try --night for wraiths)'));
+    return;
+  }
+  const top = Number(args.top || 10);
+  console.log(`hunting grounds for ${types ? types.join('/') : 'anything'}, best first:`);
+  for (const g of grounds.slice(0, top)) {
+    const kinds = [...new Set(g.spawns.map((s) => s.monsterType))].join('/');
+    console.log(`  z=${String(g.z).padStart(2)}  @${String(g.tile).padEnd(8)} `
+      + `${String(g.count).padStart(2)} spawns  ${kinds}`);
+  }
+  if (grounds.length > top) console.log(`  ... and ${grounds.length - top} more`);
+}
+
 async function cmdMaps(args) {
   const fs = await import('node:fs');
   const out = args.out || 'avalon_maps.json';
@@ -537,9 +573,19 @@ async function cmdMaps(args) {
     const zn = maps[z];
     const blocked = zn.rows.reduce((n, r) => n + [...r].filter((c) => c === '#').length, 0);
     const tot = zn.widthTiles * zn.heightTiles;
+    // Spawns are printed per TYPE because that is how the failure shows up: an
+    // extractor that silently found the wrong array still reports a plausible
+    // total, and "z=0 has no rats" is the line that catches it.
+    const byType = {};
+    for (const s of zn.spawns || []) {
+      byType[s.monsterType] = (byType[s.monsterType] || 0) + 1;
+    }
+    const spawnStr = Object.entries(byType)
+      .sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}x${n}`).join(' ') || 'none';
     console.log(`z=${z}: ${zn.widthTiles}x${zn.heightTiles}  `
       + `blocked=${blocked}/${tot} (${Math.round(100 * blocked / tot)}%)  `
-      + `teleports=${zn.teleports.length}`);
+      + `teleports=${zn.teleports.length}\n`
+      + `      spawns=${(zn.spawns || []).length}: ${spawnStr}`);
   }
   console.log(`wrote ${out}`);
 }
@@ -551,6 +597,7 @@ const cmd = args._[0];
 
 const COMMANDS = {
   farm: cmdFarm, where: cmdWhere, respawn: cmdRespawn, send: cmdSend, maps: cmdMaps,
+  spots: cmdSpots,
   lead: cmdLead, escort: cmdEscort, swarm: cmdSwarm,
   heal: cmdHeal, follow: cmdFollow, move: cmdMove,
 };

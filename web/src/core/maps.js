@@ -58,6 +58,34 @@ function parseRows(arrLiteral) {
   return rows;
 }
 
+/**
+ * Monster spawn points: `{id, monsterType, tileX, tileY, leashTiles, nightOnly}`.
+ *
+ * These are what make "go where the prey is" possible without a hand-written
+ * table of coordinates. The server never tells us where anything spawns; the
+ * client carries the whole list, so we read it from the same bundle the terrain
+ * comes from and it cannot disagree with the world.
+ *
+ * `leashTiles` is how far a monster wanders from its post, which is exactly the
+ * radius a farm spot covers -- so it is kept rather than discarded.
+ */
+function parseSpawns(lit) {
+  const re = /\{id:"([^"]*)",monsterType:"([^"]*)",tileX:(-?\d+),tileY:(-?\d+),leashTiles:(-?\d+)(,nightOnly:!(\d))?\}/g;
+  const out = [];
+  for (const m of lit.matchAll(re)) {
+    const s = {
+      id: m[1],
+      monsterType: m[2],
+      tile: [+m[3], +m[4]],
+      leashTiles: +m[5],
+    };
+    // Same inverted-minified-boolean trap as `oneWay`: !0 is true, !1 is false.
+    if (m[6]) s.nightOnly = m[7] === '0';
+    out.push(s);
+  }
+  return out;
+}
+
 function parseTeleports(lit) {
   const re = /\{tileX:(-?\d+),tileY:(-?\d+),toTileX:(-?\d+),toTileY:(-?\d+),toZ:(-?\d+),oneWay:!(\d),mode:"(walk|interact)"\}/g;
   const out = [];
@@ -100,9 +128,37 @@ export function extractUnderground(js) {
       const o = seg.indexOf('[', tm.index);
       tp = parseTeleports(seg.slice(o, matchBracket(seg, o)));
     }
-    zones[z] = { widthTiles: w, heightTiles: h, rows, teleports: tp };
+    // Spawns sit alongside teleports in the same zone entry.
+    let sp = [];
+    const sm = /spawns:\[/.exec(seg);
+    if (sm) {
+      const o = seg.indexOf('[', sm.index);
+      sp = parseSpawns(seg.slice(o, matchBracket(seg, o)));
+    }
+    zones[z] = { widthTiles: w, heightTiles: h, rows, teleports: tp, spawns: sp };
   }
   return zones;
+}
+
+/**
+ * Surface (z=0) spawns, which live in a bare top-level array rather than inside
+ * a zone entry like every underground floor's.
+ *
+ * Anchored on the array's CONTENT, not its name: the surface list is assigned to
+ * a minified identifier (`Bo=[...]` in one build) that the next deploy will
+ * rename. An array literal whose first element is a spawn record is unique in the
+ * bundle and survives renaming.
+ */
+export function extractSurfaceSpawns(js) {
+  // The `=` is what distinguishes it: every underground floor's list is a
+  // PROPERTY (`spawns:[{id:...`) inside a zone entry, while the surface list is
+  // ASSIGNED to a variable (`Bo=[{id:...`). Matching the record shape alone
+  // finds z=-1's inline array first and silently mislabels it as the surface --
+  // which loses every rat in the game, since rats live only up here.
+  const m = /=\[\{id:"[^"]*",monsterType:"/.exec(js);
+  if (!m) return [];
+  const open = js.indexOf('[', m.index);
+  return parseSpawns(js.slice(open, matchBracket(js, open)));
 }
 
 /**
@@ -167,6 +223,7 @@ export function extractAll(js, bundleStamp = null) {
       teleports: SURFACE_HOLES.map(([tx, ty]) => ({
         fromTile: [tx, ty], toTile: [tx, ty], toZ: -1, oneWay: false, mode: 'walk',
       })),
+      spawns: extractSurfaceSpawns(js),
     };
   }
   // The bundle filename hash changes on every deploy, so it doubles as the

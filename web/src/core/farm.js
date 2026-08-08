@@ -12,7 +12,7 @@ import * as nav from './nav.js';
 // whichever module the loader starts with, the other's bindings are live by the
 // time any of this runs. Keeping the bank logic in its own file is worth it --
 // it is the one behaviour with a table of world coordinates in it.
-import { shouldBank, bankStep } from './depot.js';
+import { shouldBank, bankStep, DEPOT_Z } from './depot.js';
 
 const now = () => performance.now() / 1000;
 
@@ -393,6 +393,13 @@ export class FarmConfig {
     this.lootPx = o.lootPx ?? TILE * 8;
     this.depth = o.depth ?? 0;
     this.entryTile = o.entryTile ?? null;
+    // Travel to where the hunted monster actually lives, instead of roaming a
+    // floor it does not spawn on. Off when `depth` was given explicitly -- that
+    // is the caller naming a floor, and overriding it would ignore them.
+    this.travel = o.travel ?? (o.depth == null);
+    // Include nightOnly spawns (wraiths) when choosing a spot. They are not
+    // there in daylight, so a wraith hunt is an empty room until you ask.
+    this.night = o.night ?? false;
     // Bank at the depot when the pack fills, instead of leaving drops behind.
     this.bank = o.bank ?? true;
     // Leave for the bank with this many slots still free -- see shouldBank.
@@ -598,15 +605,31 @@ export function takeTeleport(bot, me, tp) {
   return false;
 }
 
-/** Walk to the next hole down until we're on cfg.depth. True while travelling. */
-function descendStep(bot, me, cfg, log) {
+/**
+ * Walk to the next hole down until we're on the target floor. True while
+ * travelling.
+ *
+ * `wantTile` is where we are headed on the DESTINATION floor, and it changes
+ * which hole to take: the floors are big (120x112) and their holes are far
+ * apart, so descending by the nearest one can land us across the map from the
+ * prey. When we know the goal we pick the hole whose landing tile is closest to
+ * it, trading a longer walk up here for a much shorter one down there.
+ */
+function descendStep(bot, me, cfg, log, wantTile = null) {
   const z = bot.z ?? 0;
-  if (z <= cfg.depth) return false;
+  const want = cfg.depth;
+  if (z <= want) return false;
   const tile = [nav.tileOf(me.x), nav.tileOf(me.y)];
   let tp = null;
   if (z === 0 && cfg.entryTile) {
     tp = nav.teleports(0).find(
       (t) => t.fromTile[0] === cfg.entryTile[0] && t.fromTile[1] === cfg.entryTile[1]) || null;
+  }
+  // Only steer by the goal on the last hop, where "closest to the prey" is
+  // meaningful. On an intermediate floor the landing tile says nothing about
+  // where the NEXT hole is, so the nearest hole remains the right choice.
+  if (!tp && wantTile && z - 1 === want) {
+    tp = nav.bestTeleportToward(z, z - 1, tile, wantTile);
   }
   if (!tp) tp = nav.nearestTeleport(z, z - 1, tile);
   if (!tp) {
@@ -649,6 +672,110 @@ function climbStep(bot, me, cfg, log) {
     () => `wrong floor (z${z}, want z${cfg.depth}) -- up via ${up.mode} @${up.fromTile}`,
     log);
   takeTeleport(bot, me, up);
+  return true;
+}
+
+// Close enough to a hunting ground to call it arrived and start farming. Roughly
+// a screen: the spot is the centre of a cluster of leashed spawns, so being
+// inside this means the monsters are in view, not that we are on the exact tile.
+const SPOT_ARRIVE_PX = TILE * 8;
+// Re-pick the spot no more often than this. Choosing one is cheap, but switching
+// targets mid-walk is not: two clusters of equal value would have us oscillate
+// between them and never arrive.
+const SPOT_REPICK_S = 30.0;
+
+/**
+ * Where we should be farming, as `{z, tile}` -- cached on `bot.run`.
+ *
+ * Resolved from the client's own spawn table (see nav.huntingGrounds), so it
+ * needs no hand-written coordinates and cannot disagree with the world. Null when
+ * we hunt anything (every floor has something) or when the hunted type has no
+ * spawns at all, in which case there is nowhere better to be and roaming where we
+ * are is the honest fallback.
+ */
+export function huntSpot(bot, cfg) {
+  if (!cfg.travel || !cfg.huntTypes || !cfg.huntTypes.length) return null;
+  const cached = bot.run.farmSpot;
+  // Once chosen, a spot is KEPT. Re-ranking mid-run would hand back a different
+  // cluster of equal value and walk us off a perfectly good field -- and since
+  // huntingGrounds is a pure function of the static spawn table, a later call
+  // cannot know anything the first one didn't. The recheck exists only to pick a
+  // spot up once maps finish loading, so it stops as soon as we have one.
+  if (cached) return cached;
+  // No spot yet. Retry on a timer rather than every tick: the userscript starts
+  // with the embedded fallback maps and swaps in the live ones a moment later, so
+  // a lookup that found nothing at boot deserves another go -- but re-ranking 155
+  // spawns at 10 Hz to keep learning "still nothing" does not.
+  if (cached === null && since(bot, 'farmSpotAt') < SPOT_REPICK_S) return null;
+  const grounds = nav.huntingGrounds(cfg.huntTypes, { night: cfg.night });
+  const spot = grounds.length ? { z: grounds[0].z, tile: grounds[0].tile } : null;
+  bot.run.farmSpot = spot;
+  bot.run.farmSpotAt = now();
+  return spot;
+}
+
+/**
+ * Travel to the hunting ground: change floors if it is on another one, then walk
+ * to it. True while still travelling.
+ *
+ * This is what the issue asked for: pick caveBat on the surface and the bot used
+ * to roam a floor with no cave bats on it forever, because the prey lives on
+ * z=-1 and nothing ever told it to go down. Now the hunt choice implies a
+ * destination.
+ *
+ * Healthy-only by position rather than by its own HP check: the retreat branch
+ * above returns before we get here whenever `bot.fleeing` is set, so a hurt bot
+ * heals first and resumes the trip on the way back up. The trip can cross a floor
+ * or two, and starting it at 20% HP walks a nearly-dead bot past everything that
+ * just hurt it.
+ */
+function travelStep(bot, snap, me, cfg, log, spot) {
+  if (!spot) return false;
+  const z = bot.z ?? 0;
+
+  // Wrong floor -> reuse the existing depth machinery, aimed at the spot. The
+  // caller has already pointed cfg.depth here, so descend/climb and the trapdoor
+  // obstacle rule all agree on where we are going.
+  if (z > spot.z) return descendStep(bot, me, cfg, log, spot.tile);
+  // Below the target floor is climbStep's job, and the caller runs it ahead of us.
+  if (z < spot.z) return false;
+
+  const [tx, ty] = [spot.tile[0] * TILE, spot.tile[1] * TILE];
+  if (distPx(me.x, me.y, tx, ty) <= SPOT_ARRIVE_PX) {
+    if (!bot.run.farmArrived) {
+      bot.run.farmArrived = true;
+      log?.(`arrived at the ${cfg.huntTypes.join('/')} spot on z${spot.z} `
+        + `@${spot.tile} -- farming here`);
+    }
+    return false;
+  }
+  // Out of range again -- a bank run, a chase, or a retreat took us away. Re-arm
+  // the arrival notice so the walk back is announced too, rather than the log
+  // going quiet for the rest of the run after the first arrival.
+  bot.run.farmArrived = false;
+
+  // A monster we are hunting is already in view: fight it rather than walking
+  // past it to reach the nominal centre of the spot. Without this the bot shoves
+  // through a room full of prey to stand on a specific tile.
+  if (nearestHuntable(snap, me, cfg.huntTypes)) return false;
+
+  const [dx, dy] = navStep(bot, me, tx, ty);
+  if (dx === 0 && dy === 0) {
+    // The pathfinder is done or the goal is unreachable. Either way, standing
+    // here re-asking is the freeze documented in nav.js -- treat it as arrived
+    // and let ROAM find the monsters from wherever we got to.
+    if (!bot.run.farmSpotStuck) {
+      bot.run.farmSpotStuck = true;
+      log?.(`cannot get closer to the ${cfg.huntTypes.join('/')} spot @${spot.tile} `
+        + '-- farming from here');
+    }
+    return false;
+  }
+  bot.run.farmSpotStuck = false;
+  farmLog(bot, 'TRAVEL',
+    () => `to the ${cfg.huntTypes.join('/')} spot on z${spot.z} @${spot.tile} `
+      + `(${(distPx(me.x, me.y, tx, ty) / TILE).toFixed(0)} tiles)`, log);
+  bot.move(dx, dy);
   return true;
 }
 
@@ -823,6 +950,16 @@ export function makeFarm(cfg, log) {
   return function tick(bot, snap) {
     const me = meOf(bot, snap);
     if (!me) return;
+
+    // Resolve the destination BEFORE anything reads cfg.depth, because two
+    // things below depend on it and both get the wrong answer otherwise:
+    // setNavObstacles treats trapdoors as walls unless we mean to go down (so a
+    // stale depth of 0 makes A* route around the very hole we need), and
+    // climbStep would read us as "too deep" and climb back out of the floor we
+    // just travelled to.
+    const spot = huntSpot(bot, cfg);
+    if (spot) cfg.depth = spot.z;
+
     setNavObstacles(bot, snap, me, cfg.depth);
 
     if (respawnIfDead(bot, me, log)) return;
@@ -884,14 +1021,25 @@ export function makeFarm(cfg, log) {
     // on is strictly worse than the walk to the depot. Latched, because the trip
     // has to survive the rats we pass on the way -- without the latch the first
     // rat in view would pull us back into FIGHT one tile from the box.
-    if (!bot.run.banking && shouldBank(bot, cfg)) {
+    // Only underground when there is no depot to walk to. bankStep declines every
+    // tick off z=0, so latching the trip down there sets `banking` for good: the
+    // bot then farms on with a full pack while permanently believing it is on a
+    // bank run. Harmless when the CLI pinned us below with --depth, but travel
+    // routes bots underground as a matter of course, so it is now the normal case.
+    if (!bot.run.banking && (bot.z ?? 0) === DEPOT_Z && shouldBank(bot, cfg)) {
       bot.run.banking = true;
       const [free, cap] = bot.packSpace();
       log?.(`pack ${cap - free}/${cap} -- heading to the depot`);
     }
     if (bot.run.banking && bankStep(bot, snap, me, cfg, log)) return;
 
-    // --- travel to the target floor, only when healthy -------------------
+    // --- travel to where the prey actually lives, only when healthy -------
+    // Ahead of prey selection because the whole point is that there is no prey
+    // here: a caveBat hunt on the surface has nothing to select, and roaming for
+    // it is what this replaces. travelStep yields the tick the moment a hunted
+    // monster is in view, so arriving mid-room starts the fight immediately.
+    if (travelStep(bot, snap, me, cfg, log, spot)) return;
+
     if (cfg.depth < 0 && descendStep(bot, me, cfg, log)) return;
 
     // --- who else is here -------------------------------------------------

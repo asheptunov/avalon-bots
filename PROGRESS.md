@@ -8,6 +8,53 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## 2026-08-08 — the bot goes to where its prey lives (#4)
+
+**The bug.** Pick "caveBat" on floor 0 and the bot roamed the surface forever.
+Every cave bat in the game spawns underground, `cfg.depth` was 0, and
+`descendStep` is gated on `depth < 0` — so nothing ever told it to go down. It was
+hunting a monster that does not exist where it was standing.
+
+**The data was already there.** The client bundle carries a full spawn table —
+155 entries of `{id, monsterType, tileX, tileY, leashTiles, nightOnly}`, one
+`spawns:[…]` per underground zone plus a bare array for the surface. So this needed
+no hand-written coordinate table: `maps.js` extracts it beside the terrain, and
+`nav.huntingGrounds()` clusters and ranks it. `spots --hunt caveBat` prints the
+answer without logging in.
+
+| floor | spawns |
+|---|---|
+| z=0 | rat×21, iceWizard×13, wraith×5 (night), iceArchmage, trainingDummy |
+| z=-1 | caveBat×30, orc×10 |
+| z=-2 | orc×18, caveBat×6, goblin×6, orcZealot |
+| z=-3 | goblin×14, caveBat×4 |
+| z=-4 | caveBat×5, orrinVale |
+| z=-5 | hellMage×10, hellArchmage |
+| z=-6 | lizardman×8 |
+
+### Three things that were wrong on the first pass
+1. **The surface array is an assignment, not a property.** Anchoring on the record
+   shape (`[{id:"…",monsterType:`) matches z=-1's inline `spawns:[…]` *first* and
+   labels it the surface — which puts cave bats on z=0 and loses every rat in the
+   game. The `=[` prefix is the thing that distinguishes it. Regression-tested.
+2. **Depth has to be discounted.** The richest caveBat cluster is on z=-4, through
+   hell past two bosses; ranking by raw count sent a level-1 character there for
+   one extra bat. Each floor down now costs 55% of a spot's value, which keeps the
+   hunt on z=-1.
+3. **The floors are not connected regions.** z=-1 has a bat cave at the 58,22
+   entrance and a separate orc den reachable *only* via the hole at 20,78 — no
+   path between them. Choosing the nearest hole handed A* an unreachable goal, so
+   `bestTeleportToward` now verifies connectivity and only then ranks by distance.
+   Every basic mob (rat/caveBat/orc/goblin) has a verified route from town.
+
+Also: `travel` is on by default but off whenever `--depth` is given explicitly
+(that is the caller naming a floor), `--no-travel` opts out, and the panel gained a
+"go to the monster's area" tick box. `ghost` is in `MONSTER_TYPES` with no spawn
+point anywhere, and `wraith` is the actual night-only monster — both are now
+reported rather than silently walked toward.
+
+---
+
 ## 2026-08-07 — depot banking, and two failure modes that were killing runs
 
 **The bot now banks.** When the pack fills it walks to the town depot, stows the

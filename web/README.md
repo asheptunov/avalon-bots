@@ -49,6 +49,7 @@ up new releases on its own check. Nothing is sent until you press Start.
 | cook raw meat | `--no-cook` to disable | raw meat is worth far more cooked |
 | merge stacks | `--no-stack` to disable | pour split stacks together to free pack slots |
 | bank at depot when full | `--no-bank` to disable | walk to the town depot, stow the haul, come back |
+| go to the monster's area | `--no-travel` to disable | walk (and descend) to where the hunted monster actually spawns |
 | avoid other players | `--no-courtesy` to disable | don't tag their monsters or take their drops |
 
 Retreat and resume are deliberately different numbers. That hysteresis is what
@@ -66,6 +67,46 @@ Both carry limits trigger a trip. Slots are the obvious one; **weight** is the o
 that bites on ore and armour, where the pack still shows free slots while the
 server refuses every pickup ("Overloading stops you picking more up"). `where`
 prints both.
+
+### Going where the monster actually is
+
+Picking a monster used to be a promise the bot couldn't keep. Choose "caveBat" on
+the surface and it roamed z=0 forever, because **every cave bat in the game spawns
+underground** and nothing ever told it to go down — it hunted a monster that does
+not exist where it was standing.
+
+So the hunt choice now implies a destination. The client bundle carries the whole
+spawn table — 155 points of `{monsterType, tile, leashTiles, nightOnly}` — and it
+is extracted alongside the collision maps, from the same bundle, so it cannot
+disagree with the world:
+
+```sh
+node src/cli/main.js spots --hunt caveBat    # where would it go? (no login needed)
+```
+
+Nearby spawns are grouped into one **spot**, because a lone monster on a 5-tile
+leash is a few seconds of farming and then a respawn wait — concentrations are
+what make a place worth walking to. The bot picks the best spot, changes floors if
+it is downstairs, walks there, and farms. It stops travelling the moment a hunted
+monster comes into view, so arriving mid-cave starts the fight rather than shoving
+through to a nominal centre tile.
+
+Two rules in the ranking are worth knowing, because both were wrong first:
+
+- **Depth is discounted, not ignored.** The richest cave-bat cluster in the bundle
+  is on z=-4, through hell and past two bosses. Ranking on spawn count alone
+  marched a starting character down there to gain one extra bat, so each floor
+  down costs a fixed fraction of a spot's value — which keeps a bat hunt on z=-1,
+  one ladder from town.
+- **The floors are not connected.** z=-1 holds a bat cave around the 58,22
+  entrance and a separate orc den reachable only through the hole at 20,78, with
+  no path between them. So the descent picks the hole that can actually *reach*
+  the spot, not the nearest one; ranking holes by distance alone walked the bot
+  into the wrong cave and left it roaming — the same symptom all this removes.
+
+Monsters with no spawn point anywhere (`ghost`) and night-only ones (`wraith`,
+absent by day unless you pass `--night`) are reported rather than silently walked
+toward.
 
 ### Staying out of other players' way
 
@@ -126,6 +167,7 @@ node src/cli/main.js move    58,22 --account alice
 node src/cli/main.js follow  "Someone" --account alice
 node src/cli/main.js heal    --account alice
 node src/cli/main.js send    '{"type":"…"}' --account alice
+node src/cli/main.js spots   --hunt caveBat        # no login needed
 ```
 
 ## Collision maps take care of themselves
@@ -134,6 +176,12 @@ The maps are **generated from the game client** — the server never sends
 terrain. z=-1..-6 are ASCII grids in the bundle; z=0 is procedural, so we run the
 client's *own* generator rather than re-implementing seeded noise (a re-port
 diverges silently the first time the game tweaks a constant).
+
+The same extraction picks up the **monster spawn table** and the per-floor
+teleports, which is what lets the bot walk to where its prey lives. `maps` prints
+the spawns per floor per type, because that is how a bad parse shows itself — a
+wrong anchor still reports a plausible total, and "z=0 has no rats" is the line
+that catches it.
 
 That means a redeploy invalidates any baked-in copy, and it fails quietly: the
 bot walks into a tree the map says is open. So neither runtime uses a baked-in
@@ -185,9 +233,9 @@ them would ship ~900 lines of unreachable code.
 
 ```
 src/core/protocol.js    binary codec
-src/core/maps.js        collision-map extraction from the client bundle
+src/core/maps.js        collision-map + spawn-table extraction from the bundle
 src/core/bot.js         AvalonBot: state, inventory, outbound verbs
-src/core/nav.js         A* over the collision grid
+src/core/nav.js         A* over the collision grid; hunting-ground selection
 src/core/farm.js        the farm state machine
 src/core/swarm.js       party readiness + escort/leader behaviour
 src/core/intents.js     heal / follow / move
