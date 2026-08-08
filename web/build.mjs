@@ -34,6 +34,10 @@ const MODULES = [
   'transport/pagemaps.js',
   'core/bot.js',
   'core/nav.js',
+  // depot.js and farm.js import from each other. That cycle is invisible here --
+  // flattening puts every function in one scope, and they are all hoisted
+  // declarations -- so the order between these two is presentational only.
+  'core/depot.js',
   'core/farm.js',
   'ui.js',
   'main.js',

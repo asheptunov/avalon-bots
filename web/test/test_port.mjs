@@ -481,13 +481,16 @@ test('loot within reach is taken out of the corpse', () => {
 });
 
 test('a full backpack warns once and keeps fighting instead of looting', () => {
+  // bank:false -- with banking on, a full pack goes to the depot instead of
+  // warning (test_depot.mjs covers that). This still pins the no-bank fallback:
+  // a full bag stops LOOTING, never fighting.
   const bot = withBackpack(makeBot(), [{ instanceId: 'x', itemId: 'rock' }]);
   bot.stats = { statusEffects: [{ kind: 'wellFed' }] };
   const snap = decodeSnapshot(snapshot({
     players: [player()],
     ground: [{ id: 'g1', x: 100, y: 100, item: { instanceId: 'i1', itemId: 'gold' } }],
   }));
-  const logs = runTick(bot, snap, { cook: false, stack: false });
+  const logs = runTick(bot, snap, { cook: false, stack: false, bank: false });
   assert.ok(logs.some((l) => l.includes('BACKPACK FULL')));
   const mv = bot.sent.filter((s) => typeof s === 'string').map((s) => JSON.parse(s))
     .some((m) => m.type === 'moveItem');

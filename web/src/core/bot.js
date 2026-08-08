@@ -125,8 +125,8 @@ export class AvalonBot {
   }
 
   /**
-   * [freeSlots, capacity]. Slots -- not weight -- are the real carry limit:
-   * the server has weight values for flavour but no capacity cap.
+   * [freeSlots, capacity] in SLOTS. See also `overloaded()` -- slots are only
+   * half the limit, and a bot that checks this one alone will loot in a loop.
    */
   packSpace() {
     const pack = this.backpack();
@@ -135,6 +135,34 @@ export class AvalonBot {
     let free = 0;
     for (const c of contents) if (c == null) free++;
     return [free, contents.length];
+  }
+
+  /**
+   * [carriedOz, capacityOz] from the server's own stats, or [0, 0] if it hasn't
+   * told us yet.
+   *
+   * This exists because "slots are the real carry limit" -- which this file used
+   * to assert -- is FALSE. The client says it plainly: "Overloading stops you
+   * picking more up." A bot that only counts slots sees room, sends takeItem,
+   * gets refused on weight, and sends it again forever. That is exactly the loop
+   * Dario got stuck in on a corpse he could not lift.
+   */
+  weight() {
+    const s = this.stats || {};
+    return [s.carriedWeightOz || 0, s.capacityOz || 0];
+  }
+
+  /**
+   * True when we're too heavy to pick anything else up.
+   *
+   * `margin` leaves headroom because the check has to be made BEFORE we know
+   * what the next item weighs: at exactly capacity the server still refuses, and
+   * a bot that waits for equality re-learns that once per item.
+   */
+  overloaded(marginOz = 0) {
+    const [carried, cap] = this.weight();
+    if (!cap) return false;                 // no stats yet -- don't guess
+    return carried + marginOz >= cap;
   }
 
   /** True if a server status effect (e.g. 'wellFed') is active. */

@@ -54,6 +54,26 @@ export function nearestTeleport(z, toZ, fromTile, mode = null) {
   }, null).t;
 }
 
+/**
+ * Tiles on `z` that drop you DOWN the moment you stand on them.
+ *
+ * These are the 'walk'-mode holes, and they are a trap for a pathfinder: an
+ * 'interact' ladder is inert until you send useTeleport, but a hole fires on
+ * contact. So A* routing a chase THROUGH one silently teleports the bot to
+ * another floor -- which is how a surface rat-hunt ended up on z=-1, looting
+ * among monsters it had no orders to fight.
+ *
+ * Returned as a Set of tileKeys so it can be handed straight to pathStep's
+ * `blocked` set, which is also how dynamic player-collision is done.
+ */
+export function trapdoorTiles(z) {
+  const out = new Set();
+  for (const t of teleports(z)) {
+    if (t.mode === 'walk' && t.toZ < z) out.add(tileKey(t.fromTile[0], t.fromTile[1]));
+  }
+  return out;
+}
+
 /** Nearest teleport on `z` that goes UP, or null on the surface. */
 export function nearestUpwardTeleport(z, fromTile) {
   const up = teleports(z).filter((t) => t.toZ > z);

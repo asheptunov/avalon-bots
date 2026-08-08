@@ -15,7 +15,10 @@
 
 import { openSession } from '../transport/node.js';
 import { AvalonBot } from '../core/bot.js';
-import { makeFarm, FarmConfig, meOf, handleDialogue } from '../core/farm.js';
+import {
+  makeFarm, FarmConfig, meOf, handleDialogue, handleLootRefusal,
+} from '../core/farm.js';
+import { handleDepot } from '../core/depot.js';
 import {
   makeSwarm, makeSwarmLeader, PartyConfig, INTENTS, FORMATIONS,
 } from '../core/swarm.js';
@@ -73,7 +76,8 @@ farm flags:
   --depth <z>          0 = surface, negative = underground    (default 0)
   --entry <x,y>        which hole to descend by
   --until-hp <pct>     stop once HP drops to this
-  --no-loot --no-eat --no-cook --no-stack
+  --no-loot --no-eat --no-cook --no-stack --no-bank
+  --bank-free <n>      head to the depot with this many slots left (default 1)
   --duration <sec>     stop after N seconds (for test runs)
   --quiet              only log state changes
 
@@ -167,6 +171,8 @@ async function run(args, makeIntent, { onWelcome, oneShot = false } = {}) {
 
   send = conn.send;
   bot.onJsonMessage((b, msg) => handleDialogue(b, msg, log));
+  bot.onJsonMessage((b, msg) => handleDepot(b, msg, log));
+  bot.onJsonMessage((b, msg) => handleLootRefusal(b, msg, log));
   log(`connecting as ${conn.account.username} / ${conn.character.name}`);
 
   if (args.duration) {
@@ -227,6 +233,8 @@ async function cmdFarm(args) {
     eat: !args['no-eat'],
     cook: !args['no-cook'],
     stack: !args['no-stack'],
+    bank: !args['no-bank'],
+    bankFreeSlots: num(args['bank-free'], 1),
   });
   await run(args, (bot, log) => makeFarm(cfg, log));
 }
@@ -281,6 +289,13 @@ async function cmdWhere(args) {
         }
         const inv = [...held.entries()].map(([id, n]) => `${id} x${n}`).join(', ');
         console.log(`  pack     ${cap - free}/${cap} slots used`);
+        // Weight is the OTHER carry limit, and the one that silently refuses
+        // pickups while the slot count still looks fine.
+        const [carried, capOz] = bot.weight();
+        if (capOz) {
+          console.log(`  weight   ${Math.round(carried)}/${Math.round(capOz)} oz`
+            + `${bot.overloaded() ? '  !! OVERLOADED' : ''}`);
+        }
         console.log(`  carrying ${inv || '(nothing)'}`);
         finish(0);
       }, 100);
@@ -486,6 +501,8 @@ async function cmdSwarm(args) {
     });
     send = conn.send;
     bot.onJsonMessage((b, msg) => handleDialogue(b, msg, log));
+    bot.onJsonMessage((b, msg) => handleDepot(b, msg, log));
+    bot.onJsonMessage((b, msg) => handleLootRefusal(b, msg, log));
     bots.push({ bot, conn, tag });
   };
 

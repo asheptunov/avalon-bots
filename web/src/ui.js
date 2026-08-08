@@ -78,6 +78,8 @@ export function createPanel({ onStart, onStop }) {
         <input id="loot" type="checkbox" checked></div>
       <div class="row"><label for="eat">eat / cook / stack</label>
         <input id="eat" type="checkbox" checked></div>
+      <div class="row"><label for="bank">bank at depot when full</label>
+        <input id="bank" type="checkbox" checked></div>
       <div class="row"><button id="go">Start</button></div>
       <div class="stat"><span>state</span><b id="s-state">idle</b></div>
       <div class="stat"><span>hp</span><b id="s-hp">–</b></div>
@@ -114,6 +116,7 @@ export function createPanel({ onStart, onStop }) {
       resumeFrac: Math.max(0, Math.min(100, +$('resume').value)) / 100,
       loot: $('loot').checked,
       eat, cook: eat, stack: eat,
+      bank: $('bank').checked,
     };
   }
 

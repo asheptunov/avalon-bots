@@ -7,6 +7,12 @@
 
 import { TILE, MELEE_RANGE_PX } from './protocol.js';
 import * as nav from './nav.js';
+// depot.js imports back from here (distPx / navStep / farmLog). That cycle is
+// fine and deliberate: both sides export only hoisted function declarations, so
+// whichever module the loader starts with, the other's bindings are live by the
+// time any of this runs. Keeping the bank logic in its own file is worth it --
+// it is the one behaviour with a table of world coordinates in it.
+import { shouldBank, bankStep } from './depot.js';
 
 const now = () => performance.now() / 1000;
 
@@ -49,8 +55,26 @@ function occupiedTiles(snap, me) {
   return s;
 }
 
-export function setNavObstacles(bot, snap, me) {
-  bot.run.occupied = occupiedTiles(snap, me);
+/**
+ * Dynamic obstacles for this tick: other players, plus any hole we must not
+ * fall down.
+ *
+ * The holes are the important half. A 'walk' teleport fires on contact, so
+ * routing a chase across one drops the bot a floor without any decision being
+ * made -- it just arrives somewhere else, mid-fight, with the wrong prey list.
+ * Treating them as walls means A* goes around, and the only way down is the
+ * deliberate one in descendStep.
+ *
+ * `wantDepth` is where we are TRYING to be: when that is below us the holes are
+ * the route, not a hazard, so they stay open.
+ */
+export function setNavObstacles(bot, snap, me, wantDepth = 0) {
+  const occupied = occupiedTiles(snap, me);
+  const z = bot.z ?? 0;
+  if (wantDepth >= z) {
+    for (const k of nav.trapdoorTiles(z)) occupied.add(k);
+  }
+  bot.run.occupied = occupied;
 }
 
 /** Step toward a pixel target using A* over the collision grid. */
@@ -282,6 +306,10 @@ export class FarmConfig {
     this.lootPx = o.lootPx ?? TILE * 8;
     this.depth = o.depth ?? 0;
     this.entryTile = o.entryTile ?? null;
+    // Bank at the depot when the pack fills, instead of leaving drops behind.
+    this.bank = o.bank ?? true;
+    // Leave for the bank with this many slots still free -- see shouldBank.
+    this.bankFreeSlots = o.bankFreeSlots ?? 1;
   }
 }
 
@@ -321,6 +349,47 @@ function cookAndStack(bot, cfg, log) {
 }
 
 /**
+ * Stop trying to pick `instanceId` up, for the rest of this run.
+ *
+ * The ban list is pruned to items still on the floor on every insert: a
+ * multi-hour run otherwise accumulates thousands of despawned ids and tests
+ * every one of them on every tick.
+ */
+export function banLoot(bot, snap, instanceId) {
+  const onFloor = new Set();
+  for (const [, i] of lootCandidates(bot, snap)) onFloor.add(i.instanceId);
+  const skip = new Set();
+  for (const id of bot.run.farmLootSkip || []) if (onFloor.has(id)) skip.add(id);
+  skip.add(instanceId);
+  bot.run.farmLootSkip = skip;
+  bot.run.farmChase = null;
+}
+
+/**
+ * Answer a server refusal ("that is too heavy to carry") by banning the item we
+ * just asked for.
+ *
+ * The proactive `overloaded()` check in lootStep stops most of these, but it
+ * cannot stop all of them: it knows our total weight, not what the next item
+ * weighs, so an item heavier than our remaining headroom still gets requested
+ * once. Without this handler that single item is retried forever -- the exact
+ * loop that pinned Dario to a corpse. Wired into onJson like handleDialogue,
+ * because refusals arrive as JSON and the farm loop only sees snapshots.
+ */
+export function handleLootRefusal(bot, msg, log) {
+  if (msg?.type !== 'statusMessage') return false;
+  // Match on the failure, not on an exact string: the server's wording is not
+  // ours to depend on, but "heavy"/"carry"/"capacity" all mean the same refusal.
+  if (!/heav|carry|capacit|overload/i.test(msg.text || '')) return false;
+  const pending = bot.run.farmPendingLoot;
+  if (!pending) return false;
+  banLoot(bot, bot.state || { groundItems: bot.groundItems }, pending.instanceId);
+  bot.run.farmPendingLoot = null;
+  log?.(`server refused ${pending.itemId} (${msg.text}) -- skipping it`);
+  return true;
+}
+
+/**
  * Walk to the nearest drop and take it. True if busy looting this tick.
  *
  * `found` is the already-scanned nearestLoot result when the caller has one --
@@ -341,21 +410,28 @@ function lootStep(bot, snap, me, log, found = undefined) {
   }
   bot.run.farmWarnedFull = false;
 
+  // Weight, not just slots. The server refuses a pickup that would overload us
+  // even with slots to spare, and the refusal costs nothing to send -- so a bot
+  // that only counted slots stood on a corpse re-requesting the same item at
+  // 2.5 Hz forever. Stop before asking.
+  if (bot.overloaded()) {
+    if (!bot.run.farmWarnedHeavy) {
+      bot.run.farmWarnedHeavy = true;
+      const [carried, capOz] = bot.weight();
+      log?.(`!! OVERLOADED (${Math.round(carried)}/${Math.round(capOz)} oz) -- `
+        + 'cannot pick anything up.');
+    }
+    return false;
+  }
+  bot.run.farmWarnedHeavy = false;
+
   // Track how long we've chased this one so an unreachable drop can't stall the
   // loop forever. Keyed on the ITEM: several items can share one corpse.
   const [chased, chaseStart] = bot.run.farmChase || [null, 0];
   if (chased !== it.instanceId) {
     bot.run.farmChase = [it.instanceId, now()];
   } else if (now() - chaseStart > LOOT_TIMEOUT_S) {
-    // Ban it, but keep the ban list bounded to items still on the floor --
-    // otherwise a multi-hour run tests thousands of despawned ids every tick.
-    const onFloor = new Set();
-    for (const [, i] of lootCandidates(bot, snap)) onFloor.add(i.instanceId);
-    const skip = new Set();
-    for (const id of bot.run.farmLootSkip || []) if (onFloor.has(id)) skip.add(id);
-    skip.add(it.instanceId);
-    bot.run.farmLootSkip = skip;
-    bot.run.farmChase = null;
+    banLoot(bot, snap, it.instanceId);
     log?.(`giving up on ${it.itemId} (unreachable)`);
     return false;
   }
@@ -369,6 +445,8 @@ function lootStep(bot, snap, me, log, found = undefined) {
     bot.run.farmLastPickup = now();
     const src = LOOT_CONTAINERS.has(where.item.itemId) ? ' (corpse)' : '';
     log?.(`looting ${it.itemId} x${it.quantity || 1}${src}`);
+    // Remember what we asked for, so a refusal can be blamed on the right item.
+    bot.run.farmPendingLoot = { instanceId: it.instanceId, itemId: it.itemId };
     bot.takeItem(it);
   }
   return true;
@@ -446,6 +524,37 @@ function descendStep(bot, me, cfg, log) {
   }
   farmLog(bot, 'DESCEND', () => `z${z} -> z${z - 1} via ${tp.mode} @${tp.fromTile}`, log);
   takeTeleport(bot, me, tp);
+  return true;
+}
+
+/**
+ * Climb back to the floor we are supposed to be farming. True while travelling.
+ *
+ * Distinct from escapeStep, which is a panic button tied to low HP. This is the
+ * navigation fix for being somewhere we never chose to be: it fires at full
+ * health, because the problem is not danger but the fact that everything the
+ * loop wants -- the prey, the depot, the healer -- is on another floor.
+ *
+ * Note it climbs one floor per call, re-entering on the next tick from wherever
+ * the ladder put us. A fall is usually one floor, but a bot that somehow got
+ * several down still walks all the way back up.
+ */
+function climbStep(bot, me, cfg, log) {
+  const z = bot.z ?? 0;
+  const tile = [nav.tileOf(me.x), nav.tileOf(me.y)];
+  const up = nav.nearestUpwardTeleport(z, tile);
+  if (!up) {
+    if (!bot.run.farmNoWayUp) {
+      bot.run.farmNoWayUp = true;
+      log?.(`!! stuck on z${z} with no way up -- farming here instead`);
+    }
+    return false;
+  }
+  bot.run.farmNoWayUp = false;
+  farmLog(bot, 'CLIMB',
+    () => `wrong floor (z${z}, want z${cfg.depth}) -- up via ${up.mode} @${up.fromTile}`,
+    log);
+  takeTeleport(bot, me, up);
   return true;
 }
 
@@ -585,9 +694,17 @@ export function makeFarm(cfg, log) {
   return function tick(bot, snap) {
     const me = meOf(bot, snap);
     if (!me) return;
-    setNavObstacles(bot, snap, me);
+    setNavObstacles(bot, snap, me, cfg.depth);
 
     if (respawnIfDead(bot, me, log)) return;
+
+    // --- we are on the wrong floor ---------------------------------------
+    // Falling down a hole used to be unrecoverable: descendStep only runs when
+    // cfg.depth < 0, so a SURFACE bot that stepped on a hole while chasing a rat
+    // simply carried on farming at z=-1 -- where there are no rats, so it never
+    // fought, just looped looting while cave bats chewed on it. Climbing back is
+    // now the first thing we do, ahead of everything except respawning.
+    if ((bot.z ?? 0) < cfg.depth && climbStep(bot, me, cfg, log)) return;
 
     const frac = me.hp / Math.max(1, me.maxHp);
 
@@ -631,6 +748,19 @@ export function makeFarm(cfg, log) {
       if (atHealer) healAt(bot, me, healer, cfg, log);
       return;
     }
+
+    // --- bank a full pack -------------------------------------------------
+    // Below retreat/heal (a dead bot banks nothing) but above fighting: once the
+    // pack is full, every further kill drops loot we cannot pick up, so carrying
+    // on is strictly worse than the walk to the depot. Latched, because the trip
+    // has to survive the rats we pass on the way -- without the latch the first
+    // rat in view would pull us back into FIGHT one tile from the box.
+    if (!bot.run.banking && shouldBank(bot, cfg)) {
+      bot.run.banking = true;
+      const [free, cap] = bot.packSpace();
+      log?.(`pack ${cap - free}/${cap} -- heading to the depot`);
+    }
+    if (bot.run.banking && bankStep(bot, snap, me, cfg, log)) return;
 
     // --- travel to the target floor, only when healthy -------------------
     if (cfg.depth < 0 && descendStep(bot, me, cfg, log)) return;

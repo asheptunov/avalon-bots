@@ -197,10 +197,14 @@ test('fighting takes priority over looting when both are underfoot', () => {
 });
 
 test('a full backpack warns once and keeps farming instead of exiting', () => {
+  // --bank off: with banking enabled a full pack is a trip to the depot, not a
+  // warning (see test_depot.mjs). This pins the fallback that still applies
+  // underground and whenever banking is disabled -- a full bag must never be a
+  // reason to STOP.
   const junk = Array.from({ length: 8 }, (_, i) => item('junk', 1, `j${i}`));
   const bot = new FakeBot(backpack(junk, 8));
   const snap = snapshot([me([10, 10])], [], [], [drop([10, 10])]);
-  run(bot, snap, { cook: false, stack: false });
+  run(bot, snap, { cook: false, stack: false, bank: false });
   assert.equal(bot.ofType('moveItem').length, 0);
   assert.equal(bot.run.farmWarnedFull, true);
   assert.equal(bot.done, false, 'a full bag is not a reason to stop');

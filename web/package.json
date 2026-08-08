@@ -7,7 +7,7 @@
     "avalon": "src/cli/main.js"
   },
   "scripts": {
-    "test": "node --test test/test_port.mjs test/test_nav.mjs test/test_farm.mjs test/test_swarm.mjs test/test_intents.mjs test/test_maps.mjs test/test_bundle.mjs",
+    "test": "node --test test/test_port.mjs test/test_nav.mjs test/test_farm.mjs test/test_depot.mjs test/test_hazards.mjs test/test_swarm.mjs test/test_intents.mjs test/test_maps.mjs test/test_bundle.mjs",
     "build": "python build.py",
     "maps": "node src/cli/main.js maps"
   },

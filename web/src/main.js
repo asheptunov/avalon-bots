@@ -8,7 +8,10 @@
 import { installHook, makeSender } from './transport/browser.js';
 import { extractFromPage } from './transport/pagemaps.js';
 import { AvalonBot } from './core/bot.js';
-import { makeFarm, FarmConfig, meOf, handleDialogue } from './core/farm.js';
+import {
+  makeFarm, FarmConfig, meOf, handleDialogue, handleLootRefusal,
+} from './core/farm.js';
+import { handleDepot, endBanking } from './core/depot.js';
 import * as nav from './core/nav.js';
 import { createPanel } from './ui.js';
 
@@ -100,6 +103,8 @@ function boot() {
 
   bot = new AvalonBot(makeSender(state));
   bot.onJsonMessage((b, msg) => handleDialogue(b, msg, log));
+  bot.onJsonMessage((b, msg) => handleDepot(b, msg, log));
+  bot.onJsonMessage((b, msg) => handleLootRefusal(b, msg, log));
 
   function start(opts) {
     if (!bot.joined) { log('!! not joined yet -- wait for the world to load'); return; }
@@ -122,6 +127,10 @@ function boot() {
   }
 
   function stop() {
+    // Close the depot if we stopped mid-trip. This one is browser-specific
+    // courtesy: the userscript shares a screen with you, so leaving the box
+    // open would park a panel over your game that you did not open.
+    if (bot?.run?.depotOpen) endBanking(bot, log);
     if (intent) { intent = null; bot.move(0, 0); }
     panel?.setRunning(false);
     panel?.setStatus({ state: 'idle' });
