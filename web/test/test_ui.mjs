@@ -177,3 +177,24 @@ test('the built userscript carries the travel checkbox', () => {
   assert.match(code, /<input id="travel" type="checkbox"/,
     'bundle is stale: no travel checkbox -- run `node build.mjs`');
 });
+
+// The log is the only record of a run. `user-select: none` on .panel inherited
+// into it, so a stall could be watched but never copied out of the overlay --
+// which is exactly when you most want to paste it somewhere. The chrome still
+// suppresses selection; the log must not.
+test('the log tail is selectable so a run can be copied out of the overlay', () => {
+  const src = readFileSync(new URL('../src/ui.js', import.meta.url), 'utf8');
+  const panel = src.match(/\.panel\s*\{[^}]*\}/)[0];
+  assert.ok(!/user-select:\s*none/.test(panel),
+    '.panel must not blanket-disable selection -- it inherits into .log');
+  const logRule = src.match(/\.log\s*\{[^}]*\}/)[0];
+  assert.match(logRule, /user-select:\s*text/,
+    'the log must opt INTO selection, not merely stop inheriting none');
+});
+
+test('the built userscript carries the selectable log', () => {
+  const code = readFileSync(BUNDLE, 'utf8');
+  const logRule = code.match(/\.log\s*\{[^}]*\}/)?.[0] || '';
+  assert.match(logRule, /user-select:\s*text/,
+    'bundle is stale: log not selectable -- run `node build.mjs`');
+});

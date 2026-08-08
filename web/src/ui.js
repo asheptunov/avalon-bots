@@ -15,8 +15,12 @@ const CSS = `
   color: #e6e6e6; background: rgba(18,18,22,.94);
   border: 1px solid #3a3a44; border-radius: 8px;
   box-shadow: 0 6px 24px rgba(0,0,0,.45);
-  user-select: none;
 }
+/* Chrome on the panel is not text -- keep a stray drag off the labels. The LOG
+   is deliberately excluded: it is the only record of a run, and a blanket
+   user-select:none on .panel made it impossible to copy a stall out of the
+   overlay and read it anywhere else. */
+.hdr, .row label, .stat, button, select, .tgl { user-select: none; }
 .hdr {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-bottom: 1px solid #2c2c34; cursor: default;
@@ -44,6 +48,7 @@ button:disabled { opacity: .5; cursor: default; }
   height: 108px; overflow-y: auto; background: #101014;
   border: 1px solid #2c2c34; border-radius: 4px; padding: 5px 6px;
   color: #9aa4b2; white-space: pre-wrap; word-break: break-word;
+  user-select: text; -webkit-user-select: text; cursor: text;
 }
 .log div { margin-bottom: 1px; }
 .warn { color: #fbbf24; }

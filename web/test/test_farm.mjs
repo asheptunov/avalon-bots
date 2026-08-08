@@ -872,3 +872,58 @@ test('a full pack on the surface still banks', () => {
   run(bot, snapshot([me([74, 41])], []), { huntTypes: ['rat'] });
   assert.ok(bot.run.banking, 'the depot is right here -- go and use it');
 });
+
+// The two-item loot loop that pinned Dario to a corpse: he asked for a
+// shortsword, the server refused it as too heavy, he banned it -- then asked for
+// the leather armor beside it, and BANNING THE ARMOR UN-BANNED THE SWORD. Round
+// and round, forever.
+//
+// The cause is that banLoot pruned its list to "still on the floor" using
+// lootCandidates, which already hides banned items. So every previously-banned
+// id failed the on-floor test and was dropped: the list could never hold more
+// than the single most recent item, and two heavy items ping-pong.
+test('banning a second item does not un-ban the first', () => {
+  const bot = new FakeBot(backpack([]));
+  const ground = [
+    drop([10, 10], 'shortsword', 1, 'g-sword'),
+    drop([10, 10], 'leatherArmor', 1, 'g-armor'),
+  ];
+  const snap = snapshot([me([10, 10])], [], [], ground);
+
+  farm.banLoot(bot, snap, 'i-g-sword');
+  assert.ok(bot.run.farmLootSkip.has('i-g-sword'), 'the sword is banned');
+
+  farm.banLoot(bot, snap, 'i-g-armor');
+  assert.ok(bot.run.farmLootSkip.has('i-g-armor'), 'the armor is banned');
+  assert.ok(bot.run.farmLootSkip.has('i-g-sword'),
+    'banning the armor must NOT un-ban the sword -- that is the infinite loop');
+});
+
+// The corpse case: a monster's drops live INSIDE a container, so pruning has to
+// see through it or every banned drop is re-offered on the next refusal.
+test('a ban on an item inside a corpse survives the next ban', () => {
+  const bot = new FakeBot(backpack([]));
+  const corpse = drop([10, 10], 'corpse', 1, 'g-corpse');
+  corpse.item = item('corpse', 1, 'i-corpse',
+    [item('shortsword', 1, 'in-sword'), item('leatherArmor', 1, 'in-armor')]);
+  const snap = snapshot([me([10, 10])], [], [], [corpse]);
+
+  farm.banLoot(bot, snap, 'in-sword');
+  farm.banLoot(bot, snap, 'in-armor');
+  assert.ok(bot.run.farmLootSkip.has('in-sword'),
+    'the first corpse drop must stay banned when the second is banned');
+  assert.ok(bot.run.farmLootSkip.has('in-armor'));
+});
+
+// Pruning must still happen -- a multi-hour run otherwise accumulates thousands
+// of despawned ids and tests every one on every tick.
+test('a ban on an item that has left the floor is pruned', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [], [],
+    [drop([10, 10], 'leatherArmor', 1, 'g-armor')]);
+  bot.run.farmLootSkip = new Set(['i-g-gone']);
+
+  farm.banLoot(bot, snap, 'i-g-armor');
+  assert.ok(!bot.run.farmLootSkip.has('i-g-gone'),
+    'a despawned id must not be kept forever');
+});

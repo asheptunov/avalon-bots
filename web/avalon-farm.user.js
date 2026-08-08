@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Avalon Farm Bot
 // @namespace    https://github.com/asheptunov/avalon-bots
-// @version      0.5.0
+// @version      0.5.1
 // @description  Drives your on-screen Avalon character: kill / loot / cook / eat / heal.
 // @author       asheptunov
 // @match        https://avalon.juanandresleon.com/*
@@ -2190,8 +2190,18 @@ function cookAndStack(bot, cfg, log) {
  * every one of them on every tick.
  */
 function banLoot(bot, snap, instanceId) {
+  // Prune against the RAW ground, not lootCandidates: that generator already
+  // hides banned items, so pruning through it drops every ban we are trying to
+  // keep. The list could then never hold more than the single most recent id --
+  // and two heavy items ping-ponged forever, each ban un-banning the other.
   const onFloor = new Set();
-  for (const [, i] of lootCandidates(bot, snap)) onFloor.add(i.instanceId);
+  for (const g of snap.groundItems || []) {
+    const it = g.item;
+    if (!it) continue;
+    onFloor.add(it.instanceId);
+    // Corpse drops live one level down; a ban on one must survive too.
+    for (const inner of it.contents || []) if (inner) onFloor.add(inner.instanceId);
+  }
   const skip = new Set();
   for (const id of bot.run.farmLootSkip || []) if (onFloor.has(id)) skip.add(id);
   skip.add(instanceId);
@@ -2850,8 +2860,12 @@ const CSS = `
   color: #e6e6e6; background: rgba(18,18,22,.94);
   border: 1px solid #3a3a44; border-radius: 8px;
   box-shadow: 0 6px 24px rgba(0,0,0,.45);
-  user-select: none;
 }
+/* Chrome on the panel is not text -- keep a stray drag off the labels. The LOG
+   is deliberately excluded: it is the only record of a run, and a blanket
+   user-select:none on .panel made it impossible to copy a stall out of the
+   overlay and read it anywhere else. */
+.hdr, .row label, .stat, button, select, .tgl { user-select: none; }
 .hdr {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 10px; border-bottom: 1px solid #2c2c34; cursor: default;
@@ -2879,6 +2893,7 @@ button:disabled { opacity: .5; cursor: default; }
   height: 108px; overflow-y: auto; background: #101014;
   border: 1px solid #2c2c34; border-radius: 4px; padding: 5px 6px;
   color: #9aa4b2; white-space: pre-wrap; word-break: break-word;
+  user-select: text; -webkit-user-select: text; cursor: text;
 }
 .log div { margin-bottom: 1px; }
 .warn { color: #fbbf24; }

@@ -457,8 +457,18 @@ function cookAndStack(bot, cfg, log) {
  * every one of them on every tick.
  */
 export function banLoot(bot, snap, instanceId) {
+  // Prune against the RAW ground, not lootCandidates: that generator already
+  // hides banned items, so pruning through it drops every ban we are trying to
+  // keep. The list could then never hold more than the single most recent id --
+  // and two heavy items ping-ponged forever, each ban un-banning the other.
   const onFloor = new Set();
-  for (const [, i] of lootCandidates(bot, snap)) onFloor.add(i.instanceId);
+  for (const g of snap.groundItems || []) {
+    const it = g.item;
+    if (!it) continue;
+    onFloor.add(it.instanceId);
+    // Corpse drops live one level down; a ban on one must survive too.
+    for (const inner of it.contents || []) if (inner) onFloor.add(inner.instanceId);
+  }
   const skip = new Set();
   for (const id of bot.run.farmLootSkip || []) if (onFloor.has(id)) skip.add(id);
   skip.add(instanceId);
