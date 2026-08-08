@@ -45,7 +45,9 @@ up new releases on its own check. Nothing is sent until you press Start.
 | retreat below % | `--retreat-hp` | fall back to the healer under this |
 | resume above % | `--resume-hp` | resume fighting only above this |
 | loot drops | `--loot` | sweep corpses and loose drops |
-| eat / cook / stack | `--eat --cook --stack` | upkeep that makes long runs possible |
+| eat when hungry | `--no-eat` to disable | eat to hold `wellFed`, which is what regenerates HP |
+| cook raw meat | `--no-cook` to disable | raw meat is worth far more cooked |
+| merge stacks | `--no-stack` to disable | pour split stacks together to free pack slots |
 | bank at depot when full | `--no-bank` to disable | walk to the town depot, stow the haul, come back |
 
 Retreat and resume are deliberately different numbers. That hysteresis is what

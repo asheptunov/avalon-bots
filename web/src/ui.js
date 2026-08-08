@@ -5,7 +5,7 @@
 // Python CLI took as a flag (--hunt, --retreat-hp, --resume-hp, --loot, ...)
 // shows up here, plus a live status readout and a log tail.
 
-import { MONSTER_TYPES } from './protocol.js';
+import { MONSTER_TYPES } from './core/protocol.js';
 
 const CSS = `
 :host { all: initial; }
@@ -76,8 +76,12 @@ export function createPanel({ onStart, onStop }) {
         <input id="resume" type="number" min="0" max="100" step="5" value="85"></div>
       <div class="row"><label for="loot">loot drops</label>
         <input id="loot" type="checkbox" checked></div>
-      <div class="row"><label for="eat">eat / cook / stack</label>
+      <div class="row"><label for="eat">eat when hungry</label>
         <input id="eat" type="checkbox" checked></div>
+      <div class="row"><label for="cook">cook raw meat</label>
+        <input id="cook" type="checkbox" checked></div>
+      <div class="row"><label for="stack">merge stacks</label>
+        <input id="stack" type="checkbox" checked></div>
       <div class="row"><label for="bank">bank at depot when full</label>
         <input id="bank" type="checkbox" checked></div>
       <div class="row"><button id="go">Start</button></div>
@@ -109,13 +113,17 @@ export function createPanel({ onStart, onStop }) {
 
   function readConfig() {
     const hunt = $('hunt').value;
-    const eat = $('eat').checked;
     return {
       huntTypes: hunt ? [hunt] : null,
       retreatFrac: Math.max(0, Math.min(100, +$('retreat').value)) / 100,
       resumeFrac: Math.max(0, Math.min(100, +$('resume').value)) / 100,
       loot: $('loot').checked,
-      eat, cook: eat, stack: eat,
+      // Three independent switches: eating keeps regen up, cooking upgrades raw
+      // meat, stacking frees pack slots. They are unrelated jobs and you may
+      // well want one without the others.
+      eat: $('eat').checked,
+      cook: $('cook').checked,
+      stack: $('stack').checked,
       bank: $('bank').checked,
     };
   }
