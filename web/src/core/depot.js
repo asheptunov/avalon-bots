@@ -87,7 +87,14 @@ const OPEN_RETRY_S = 2.0;
 const DEPOSIT_INTERVAL_S = 0.4;
 // If a deposit round trip takes longer than this, give up and go back to
 // farming rather than standing at the bank forever.
-const DEPOT_TIMEOUT_S = 90.0;
+//
+// Raised from 90 s when banking started emptying the pack completely: the
+// budget covers the WALK as well as the deposits, and at one item per 0.4 s a
+// full 20-slot pack is ~8 s of stowing on top of a cross-town walk that can
+// itself take most of a minute. 90 s was comfortable when we stopped after five
+// deposits and tight afterwards -- and a timeout mid-empty strands the bot with
+// a half-full bag, which is the state this whole change exists to avoid.
+const DEPOT_TIMEOUT_S = 180.0;
 // Keep stowing until carried weight is under this fraction of capacity, so the
 // walk back out has headroom for an actual haul rather than one apple.
 const BANK_UNTIL_WEIGHT_FRAC = 0.8;
@@ -131,11 +138,23 @@ const KEEP_ITEMS = new Set([
   'torch',
 ]);
 
-// How many slots' worth of each kept consumable to hold back. Anything beyond
-// this is surplus and gets banked -- otherwise a long run fills the pack with
-// food and the trip frees almost nothing.
+// How many of each kept consumable to hold back. Anything beyond this is
+// surplus and gets banked.
+//
+// These are the WHOLE policy now that banking empties the pack -- the old
+// weight/slot thresholds are gone, so nothing else stops the trip. Chosen
+// conservatively on purpose: the reserves are cheap in the currency that
+// matters. Every line here totals ~57oz against a 250oz cap, because food is
+// nearly weightless (cookedMeat 2oz, apple 1oz, healthPotion 1oz) and the one
+// genuinely heavy keep is the torch at 12oz -- which is also the one item you
+// cannot improvise underground.
+//
+// rawMeat is deliberately LOW where the others are generous: it is haul we
+// happen to be able to cook, it weighs more raw (3oz) than cooked (2oz), and
+// holding ten of it is ten slots of half-value food. Keep a couple for the
+// cooking loop and bank the rest.
 const KEEP_QUANTITY = {
-  cookedMeat: 10, rawMeat: 10, fish: 5, cheese: 5, apple: 10,
+  cookedMeat: 10, rawMeat: 2, fish: 5, cheese: 5, apple: 10,
   avocado: 5, iceCream: 5, healthPotion: 5, largeHealthPotion: 5,
   manaPotion: 5, largeManaPotion: 5, torch: 1,
 };
@@ -332,15 +351,38 @@ export function shouldBank(bot, cfg) {
 }
 
 /**
- * True when the trip is finished: enough room to farm again.
+ * True when the trip is finished.
  *
- * Deliberately a HIGHER bar than `shouldBank` -- leaving the moment we are under
- * the trigger would send us back after one kill. Hysteresis, same shape as the
- * retreat/resume band in the farm loop.
+ * DEFAULT (`bankEmpty`): the trip ends when there is nothing left worth stowing
+ * -- `nextDeposit` returning null is the only stopping condition, and bankStep
+ * checks that before it ever gets here. So this returns false and the bot
+ * empties down to the essentials.
+ *
+ * Why the old partial-empty rule went. It stopped on two thresholds -- under 80%
+ * carried weight, and 40% of slots free -- and the weight one bound first on any
+ * real haul. Measured against the bundle's own item weights, a bot carrying orc
+ * gear (plate 72oz, chainmail 55, ironSword 40, ...) stopped after 5 deposits of
+ * 12 and walked out with 144oz of pure haul still in the bag. Worse, it left at
+ * 179/250oz -- 72% loaded before the first kill, so a single plate drop
+ * overflowed it and sent it straight back. The rule meant to prevent commuting
+ * was causing it.
+ *
+ * Emptying fully triples the headroom (35oz out the door instead of 179) and
+ * makes trips LESS frequent, not more -- so the hysteresis the old thresholds
+ * provided is not needed: you cannot leave too early when you leave with nothing
+ * left to leave.
+ *
+ * `--no-bank-empty` restores the thresholds, as an escape hatch for a live run
+ * that shows the full empty is wrong.
  */
 export function bankDone(bot, cfg) {
   const [free, cap] = bot.packSpace();
   if (!cap) return true;
+  // The default: bankStep only calls this when nextDeposit found something, so
+  // there is by definition still haul in the bag. Keep going.
+  if (cfg.bankEmpty ?? true) return false;
+
+  // --- legacy partial empty (--no-bank-empty) ------------------------------
   // Leaving while still overloaded would walk us back out to a field where
   // every pickup is refused -- the trip has to fix the binding limit, and
   // weight is not fixed by having free slots.

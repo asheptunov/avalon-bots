@@ -178,6 +178,31 @@ test('the built userscript carries the travel checkbox', () => {
     'bundle is stale: no travel checkbox -- run `node build.mjs`');
 });
 
+// Banking empties the pack to the essentials by default. The browser has no
+// flags, so the only way a userscript run can get the old partial-empty
+// behaviour back is this switch -- and the only way anyone notices it is broken
+// is a bot that walks out of the bank still loaded.
+
+test('the empty-the-pack switch maps through to the config', () => {
+  // Keyed by the DOM id ('bank-empty'), which is deliberately not the config
+  // field name ('bankEmpty') -- configFrom drives the panel through its real
+  // widget ids, so this is the mapping that would actually break.
+  assert.equal(configFrom({ 'bank-empty': false }).cfg.bankEmpty, false);
+  assert.equal(configFrom({ 'bank-empty': true }).cfg.bankEmpty, true);
+});
+
+test('the panel offers the empty-the-pack switch, on by default', () => {
+  const src = readFileSync(new URL('../src/ui.js', import.meta.url), 'utf8');
+  assert.match(src, /<input id="bank-empty" type="checkbox" checked>/,
+    'bank-empty needs its own checkbox, ticked by default');
+});
+
+test('the built userscript carries the empty-the-pack checkbox', () => {
+  const code = readFileSync(BUNDLE, 'utf8');
+  assert.match(code, /<input id="bank-empty" type="checkbox"/,
+    'bundle is stale: no bank-empty checkbox -- run `node build.mjs`');
+});
+
 // The log is the only record of a run. `user-select: none` on .panel inherited
 // into it, so a stall could be watched but never copied out of the overlay --
 // which is exactly when you most want to paste it somewhere. The chrome still

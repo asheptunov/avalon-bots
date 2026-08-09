@@ -49,6 +49,7 @@ up new releases on its own check. Nothing is sent until you press Start.
 | cook raw meat | `--no-cook` to disable | raw meat is worth far more cooked |
 | merge stacks | `--no-stack` to disable | pour split stacks together to free pack slots |
 | bank at depot when full | `--no-bank` to disable | walk to the town depot, stow the haul, come back |
+| empty the pack when banking | `--no-bank-empty` to disable | stow everything but food and potions, instead of stopping at a weight/slot threshold |
 | go to the monster's area | `--no-travel` to disable | walk (and descend) to where the hunted monster actually spawns |
 | avoid other players | `--no-courtesy` to disable | don't tag their monsters or take their drops |
 
@@ -67,6 +68,24 @@ Both carry limits trigger a trip. Slots are the obvious one; **weight** is the o
 that bites on ore and armour, where the pack still shows free slots while the
 server refuses every pickup ("Overloading stops you picking more up"). `where`
 prints both.
+
+**The trip empties the pack** down to food and potions. It used to stop at two
+thresholds — under 80% carried weight and 40% of slots free — and the weight one
+bound first on any real haul: a pack of orc gear stopped after 5 deposits of 12
+and walked out with 144oz still in the bag, 72% loaded before the first kill. One
+plate armour drop (72oz) overflowed that and sent the bot straight back, so the
+rule meant to prevent commuting was causing it. Emptying fully leaves at 47oz
+instead of 191 — **3.4× the headroom**, and room for two plate drops instead of
+none — which makes trips less frequent, not more. `--no-bank-empty` restores the
+thresholds.
+
+**Nested bags.** A depot box holds a fixed number of slots, but a backpack stored
+in it is itself a container, and a bag inside that bag is more storage again. The
+bot searches the nesting breadth-first for a free slot — box, then depth 1, then
+depth 2 — so a full-looking box is rarely actually full, and the haul stays as
+shallow as it can rather than being buried at the bottom of the deepest chain.
+Empty spare bags in the pack get stowed (that is what grows the depot); a bag
+with anything in it is left alone. Corpses are never filled.
 
 ### Going where the monster actually is
 

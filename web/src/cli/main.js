@@ -82,6 +82,8 @@ farm flags:
   --until-hp <pct>     stop once HP drops to this
   --no-loot --no-eat --no-cook --no-stack --no-bank
   --bank-free <n>      head to the depot with this many slots left (default 1)
+  --no-bank-empty      stop banking at a weight/slot threshold instead of
+                       emptying the pack down to food and potions
   --no-courtesy        stop yielding monsters/loot near other players
   --allies <names>     comma-separated players to treat as ours, not strangers
   --duration <sec>     stop after N seconds (for test runs)
@@ -246,6 +248,7 @@ async function cmdFarm(args) {
     stack: !args['no-stack'],
     bank: !args['no-bank'],
     bankFreeSlots: num(args['bank-free'], 1),
+    bankEmpty: !args['no-bank-empty'],
     courtesy: !args['no-courtesy'],
     allyNames: args.allies ? String(args.allies).split(',') : [],
   });

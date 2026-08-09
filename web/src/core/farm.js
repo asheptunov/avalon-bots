@@ -404,6 +404,10 @@ export class FarmConfig {
     this.bank = o.bank ?? true;
     // Leave for the bank with this many slots still free -- see shouldBank.
     this.bankFreeSlots = o.bankFreeSlots ?? 1;
+    // Empty the pack down to the essentials on a bank trip, rather than stopping
+    // at a weight/slot threshold. On by default: the old thresholds left the
+    // heavy gear -- which is the whole haul -- in the bag. See bankDone.
+    this.bankEmpty = o.bankEmpty ?? true;
     // Stay out of other players' way: don't tag their monsters, don't touch
     // their drops, drift toward free ground. On by default -- this is a shared
     // live server and looking like a griefer is not a tradeoff worth making.

@@ -508,11 +508,15 @@ test('heavy gear we cannot bank does not strand the bot at the depot', () => {
   // Worn armour and the food we keep both count against the weight cap, so a
   // bot can sit above the "keep stowing" line with nothing left it is willing
   // to give. Holding it there would end the run: it never farms again.
+  //
+  // Under the default (empty-to-essentials) this is bankStep's `!next` branch
+  // rather than bankDone's -- so it is asserted through the loop, below. Here it
+  // is pinned for the legacy threshold path, which is where the bug was.
   const bot = new FakeBot(backpack([item('apple', 1, 'a0')], 8));
   bot.stats = {
     statusEffects: [{ kind: 'wellFed' }], carriedWeightOz: 240, capacityOz: 250,
   };
-  assert.ok(depot.bankDone(bot, new farm.FarmConfig({})),
+  assert.ok(depot.bankDone(bot, new farm.FarmConfig({ bankEmpty: false })),
     'must be able to finish with nothing bankable, however heavy');
 });
 
@@ -521,8 +525,94 @@ test('while still heavy AND holding haul, the trip keeps going', () => {
   bot.stats = {
     statusEffects: [{ kind: 'wellFed' }], carriedWeightOz: 240, capacityOz: 250,
   };
-  assert.ok(!depot.bankDone(bot, new farm.FarmConfig({})),
+  assert.ok(!depot.bankDone(bot, new farm.FarmConfig({ bankEmpty: false })),
     'free slots are not enough while we are still overloaded');
+});
+
+// ---- how much comes out of the bag ----------------------------------------
+//
+// The old rule stopped at two thresholds (under 80% carried weight, 40% of slots
+// free) and the weight one bound first on any real haul: a pack of orc gear
+// stopped after 5 deposits of 12 and walked out with 144oz still in it, at 72%
+// loaded. One plate drop overflowed that and sent the bot straight back. These
+// pin the replacement -- empty down to the essentials, nothing else.
+
+test('banking empties the pack down to the essentials', () => {
+  // The headline behaviour. Every piece of gear goes; the food stays.
+  // A FULL pack -- shouldBank only fires with no free slots, so a roomy pack
+  // never starts a trip and the test would silently assert nothing.
+  const bot = new FakeBot(backpack([
+    item('plateArmor', 1, 'g1'), item('chainmail', 1, 'g2'),
+    item('ironSword', 1, 'g3'), item('warspear', 1, 'g4'),
+    item('steelHelmet', 1, 'g5'), item('cookedMeat', 3, 'food'),
+    item('healthPotion', 2, 'pot'),
+  ], 7));
+  const snap = snapshot([me([74, 40])], []);
+  pump(bot, snap, {}, 20, (b) => b.ofType('openDepot').length > 0);
+  openDepot(bot);
+  // Deposits are one per 0.4 s and the harness applies them, so drive until the
+  // trip ends of its own accord.
+  pump(bot, snap, {}, 400, (b) => !b.run.banking);
+
+  const banked = new Set(bot.ofType('moveItem').map((m) => m.instanceId));
+  for (const g of ['g1', 'g2', 'g3', 'g4', 'g5']) {
+    assert.ok(banked.has(g), `${g} should have been banked`);
+  }
+  assert.ok(!banked.has('food'), 'the food reserve stays');
+  assert.ok(!banked.has('pot'), 'the potion reserve stays');
+});
+
+test('the 80% weight line no longer stops the trip early', () => {
+  // The specific regression. Heavy, with haul left: the old rule returned
+  // "done" here as soon as carried weight crossed under 80%, stranding the rest
+  // of the gear in the bag.
+  const bot = new FakeBot(backpack([item('plateArmor', 1, 'loot')], 8));
+  bot.stats = {
+    statusEffects: [{ kind: 'wellFed' }], carriedWeightOz: 100, capacityOz: 250,
+  };
+  assert.ok(!depot.bankDone(bot, new farm.FarmConfig({})),
+    'well under the old weight line, but there is still haul -- keep stowing');
+});
+
+test('the 40% free-slots line no longer stops the trip early', () => {
+  // Plenty of free slots by the old rule (7 of 8), but haul still in the bag.
+  const bot = new FakeBot(backpack([item('ironSword', 1, 'loot')], 8));
+  assert.ok(!depot.bankDone(bot, new farm.FarmConfig({})),
+    'free slots are not a reason to leave haul behind');
+});
+
+test('--no-bank-empty restores the old thresholds', () => {
+  // The escape hatch has to actually change behaviour, or it is decoration.
+  const bot = new FakeBot(backpack([item('ironSword', 1, 'loot')], 8));
+  assert.ok(depot.bankDone(bot, new farm.FarmConfig({ bankEmpty: false })),
+    '7 of 8 slots free clears the old 40% bar');
+  assert.ok(!depot.bankDone(bot, new farm.FarmConfig({ bankEmpty: true })),
+    'and the default still empties');
+});
+
+test('an emptied pack still ends the trip rather than spinning', () => {
+  // Removing the thresholds removed a stopping condition, so the `!next` branch
+  // in bankStep is now the ONLY way a trip ends normally. If that regressed the
+  // bot would stand at the bank until the timeout, every trip.
+  const bot = new FakeBot(backpack([
+    item('dagger', 1, 'j1'), item('cookedMeat', 3, 'food'),
+  ], 2));                                            // full: 2 items, 2 slots
+  const snap = snapshot([me([74, 40])], []);
+  pump(bot, snap, {}, 20, (b) => b.ofType('openDepot').length > 0);
+  openDepot(bot);
+  pump(bot, snap, {}, 400, (b) => !b.run.banking);
+  assert.ok(!bot.run.banking, 'the trip must end once only essentials remain');
+  assert.ok(logs.some((m) => /nothing left to deposit|banking done/.test(m)),
+    `expected a finishing log, got ${logs}`);
+});
+
+test('raw meat is mostly haul -- it is heavier raw than cooked', () => {
+  // rawMeat 3oz vs cookedMeat 2oz, and raw gives a third of the wellFed
+  // duration. Holding ten of it was ten slots of half-value food.
+  const bot = new FakeBot(backpack([item('rawMeat', 9, 'raw')]));
+  const next = depot.nextDeposit(bot);
+  assert.ok(next, 'the surplus raw meat should be depositable');
+  assert.equal(next.quantity, 7, '9 held - 2 reserved');
 });
 
 test('a depotUpdate arriving after the trip does not re-arm the next one', () => {

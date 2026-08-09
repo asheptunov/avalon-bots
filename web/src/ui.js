@@ -89,6 +89,8 @@ export function createPanel({ onStart, onStop }) {
         <input id="stack" type="checkbox" checked></div>
       <div class="row"><label for="bank">bank at depot when full</label>
         <input id="bank" type="checkbox" checked></div>
+      <div class="row"><label for="bank-empty">empty the pack when banking</label>
+        <input id="bank-empty" type="checkbox" checked></div>
       <div class="row"><label for="travel">go to the monster's area</label>
         <input id="travel" type="checkbox" checked></div>
       <div class="row"><label for="courtesy">avoid other players</label>
@@ -134,6 +136,7 @@ export function createPanel({ onStart, onStop }) {
       cook: $('cook').checked,
       stack: $('stack').checked,
       bank: $('bank').checked,
+      bankEmpty: $('bank-empty').checked,
       // Walk to where the hunted monster actually spawns, changing floors if it
       // lives underground. Without this, picking a monster that does not spawn
       // where you are standing just roams forever -- cave bats are all on z=-1,

@@ -8,7 +8,7 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
-## 2026-08-08 — the depot sees through nested bags (#5)
+## 2026-08-08 — the depot sees through nested bags, and the trip empties the pack (#5)
 
 **The bank was full long before it was full.** A depot box has a fixed slot
 count, and `bankStep` addressed every `moveItem` at the box's own `instanceId`.
@@ -43,7 +43,44 @@ box, and `moveItem` is addressed to whatever it returns.
 Bounded at depth 8 with a `seen` set: the depot structure comes from the server,
 and an unbounded walk over a cycle would spin the tick rather than fail loudly.
 
-293 tests (14 new). **Not yet live-tested** — see the open item below.
+### And then the trip stopped stopping early (v0.7.0)
+
+Nesting made the bank hold more; it did not make the bot *use* the trip. The
+stopping rule was two thresholds — under 80% carried weight, and 40% of slots
+free — and the weight one bound first on every realistic haul.
+
+Simulated against the bundle's own weight table (`plateArmor` 72oz, `chainmail`
+55, `ironSword` 40, …) with Sam's real 250oz cap:
+
+| | leaves the bank at | headroom | plate drops (72oz) before overflow |
+|---|---|---|---|
+| old (thresholds) | 191oz | 59oz (24%) | 0 |
+| new (empty) | 47oz | 203oz (81%) | 2 |
+
+It stopped after **5 deposits of 12**, stranding 144oz of pure haul in the bag
+and walking out 72% loaded. A single plate drop overflowed that instantly — so
+the rule written to prevent commuting was the thing causing it.
+
+Now `nextDeposit` returning null is the *only* stopping condition: bank down to
+the essentials and leave. The hysteresis the thresholds provided is not needed,
+because you cannot leave too early when you leave with nothing left to leave —
+and trips get **less** frequent, not more. `--no-bank-empty` (and the panel's
+"empty the pack when banking") restores the old behaviour.
+
+Two consequences worth noting:
+
+- **The reserves are now the whole policy.** Nothing else stops the trip, so
+  `KEEP_QUANTITY` is load-bearing in a way it was not. Kept generous — the whole
+  keep-list is ~47oz against a 250oz cap, because food is nearly weightless and
+  the one heavy keep is the torch (12oz), which is also the one thing you cannot
+  improvise underground. `rawMeat` dropped 10 → 2: it is haul we can cook, it
+  weighs *more* raw (3oz) than cooked (2oz), and ten of it was ten slots of
+  half-value food.
+- **`DEPOT_TIMEOUT_S` 90 → 180.** The budget covers the walk as well as the
+  deposits, and a timeout mid-empty strands the bot with a half-full bag — the
+  exact state this change exists to avoid.
+
+302 tests (23 new). **Not yet live-tested** — see the open item below.
 
 ---
 
@@ -498,6 +535,12 @@ Next up:
   accept a `moveItem` addressed to a container that is itself inside the depot
   (the whole feature rests on this), and is there a nesting depth it refuses?
   Dario's depth-2 chain says 2 is fine.
+  - **And watch the full empty**, which is the riskier half: the bot should now
+    walk out of the bank carrying only food and potions. Two things to confirm —
+    that it does not time out mid-empty on a large pack (the 180 s budget covers
+    the walk too), and that the reserves are actually enough to farm on, since
+    nothing but `KEEP_QUANTITY` stops the trip now. If it walks out too light,
+    raise the reserves rather than restoring the thresholds.
   - Still open on #5, deliberately not built: **buying backpacks from
     Quartermaster Wren**. The protocol is confirmed in the bundle (`openShop
     {npcId}` → `{buy:[{itemId,price}],sell:[…]}` → `buyItem {npcId,itemId,
