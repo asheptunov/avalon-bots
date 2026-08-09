@@ -52,9 +52,40 @@ up new releases on its own check. Nothing is sent until you press Start.
 | empty the pack when banking | `--no-bank-empty` to disable | stow everything but food and potions, instead of stopping at a weight/slot threshold |
 | go to the monster's area | `--no-travel` to disable | walk (and descend) to where the hunted monster actually spawns |
 | avoid other players | `--no-courtesy` to disable | don't tag their monsters or take their drops |
+| fight back when attacked | `--no-defend` to disable | swing back at whatever is hitting us, hunt filter or not |
 
 Retreat and resume are deliberately different numbers. That hysteresis is what
 stops a bot at the threshold oscillating between fleeing and swinging.
+
+### Fighting back in mixed areas
+
+Farming areas are not single-species. The orc hole in the bottom left is an
+orc-*and-bat* room, and a strict `hunt` filter used to apply to defense as well as
+offense: the bats were invisible to prey selection, so the bot stood in the middle
+of them soaking damage without ever swinging back. It bled down to the retreat
+threshold, healed, walked back, and got chewed on again — a loop that farms
+nothing.
+
+The rule now is the one the swarm already used for the party: **`hunt` governs
+what the bot seeks out, not what it fends off.** A monster that is `enraged` and
+within about a tile of melee reach is by game mechanics fighting *us*, so it gets
+answered whatever its type. That target beats the hunted monster across the room,
+beats looting, and pauses the walk to the hunting ground — all three otherwise
+mean taking free hits.
+
+It deliberately does **not** widen what the bot picks fights with. An off-type
+monster standing idle is still left alone, and so is an enraged one mauling
+somebody else across the room — `enraged` says "in a fight", not "in a fight with
+you", so proximity is what makes it ours. It also overrides the courtesy yield: a
+monster hitting us is not a kill being stolen.
+
+The issue that prompted this asked whether fleeing from higher-tier enemies would
+be safer. It is already what happens, and by a better trigger than monster type:
+retreat fires on **HP**, so anything actually dangerous drives the bot below
+`retreat below %` and out — underground, straight up the ladder — regardless of
+what it is. Fighting back is what happens while that threshold is intact, and it
+is strictly better than the alternative, because running from something already
+in melee just means eating free hits with no damage dealt.
 
 ### Banking
 

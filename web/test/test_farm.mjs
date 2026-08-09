@@ -150,6 +150,148 @@ test('the hunt filter refuses a fight with the 16k-HP training dummy', () => {
   assert.equal(bot.ofType('attack').length, 0);
 });
 
+// ---- self-defense in mixed areas -------------------------------------------
+//
+// The orc hole (bottom left) is not an orc room -- it is an orc-and-bat room.
+// Hunting orcs there meant the bats were invisible to prey selection, so the bot
+// stood in the middle of them taking damage and never swinging back: it bled to
+// retreatFrac, healed, walked back, and got chewed on again forever.
+//
+// The rule these pin down is the one swarm.js already settled for the party:
+// huntTypes governs what we SEEK OUT, not what we fend off.
+
+/** A monster mid-fight with us: enraged and on top of us. */
+const attacker = (tile = [10, 10], hp = 20, mid = 'bat1', mtype = 'caveBat') =>
+  ({ ...rat(tile, hp, mid, mtype), enraged: true });
+
+/**
+ * Hunt orcs right here, without the trip.
+ *
+ * `travel` is on by default and orcs live underground, so a plain orc hunt spends
+ * these snapshots in DESCEND and never reaches prey selection at all. Every test
+ * below is about WHO gets picked once we are standing in the mixed room, so the
+ * trip is exactly the part to switch off -- the one test that does care about it
+ * travels deliberately, at the end.
+ */
+const hunting = (o = {}) =>
+  ({ huntTypes: ['orc'], travel: false, cook: false, stack: false, ...o });
+
+test('a bat attacking us is fought back even while hunting orcs', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker([10, 10])]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1',
+    'the hunt filter must not make our own attacker invisible');
+  assert.equal(stateOf(bot), 'DEFEND');
+});
+
+test('an idle off-type monster is still left alone', () => {
+  // The other half of the rule: this is what stops DEFEND collapsing into
+  // "hunt everything". A bat that is not fighting us is not our business.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [rat([10, 10], 20, 'bat1', 'caveBat')]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack').length, 0, 'not enraged -- not our fight');
+  assert.equal(stateOf(bot), 'ROAM');
+});
+
+test('an enraged monster across the room is not our fight', () => {
+  // Enraged pins down "in a fight", not "in a fight with US" -- the server never
+  // says whose. Proximity is the only thing that makes it ours, so a bat mauling
+  // someone else 15 tiles away must not pull us off the hunt.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker([25, 10])]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack').length, 0);
+  assert.notEqual(stateOf(bot), 'DEFEND');
+});
+
+test('--no-defend restores the old ignore-everything-off-type behaviour', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker([10, 10])]);
+  run(bot, snap, hunting({ defend: false }));
+  assert.equal(bot.ofType('attack').length, 0);
+});
+
+test('the hunted monster still wins when nothing is attacking us', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])],
+    [rat([10, 10], 20, 'orc1', 'orc'), rat([11, 10], 20, 'bat1', 'caveBat')]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'orc1');
+  assert.equal(stateOf(bot), 'FIGHT');
+});
+
+test('being attacked outranks the hunted monster across the room', () => {
+  // The orc we came for is 8 tiles off; the bat is in our face. Walking to the
+  // orc means eating hits the whole way and arriving hurt.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])],
+    [rat([18, 10], 20, 'orc1', 'orc'), attacker([10, 10])]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1');
+});
+
+test('two attackers: the one nearest death is finished first', () => {
+  // Lowest HP first, matching threatsToParty -- it is the one that stops hitting
+  // us soonest.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])],
+    [attacker([10, 10], 18, 'healthy'), attacker([10, 10], 3, 'nearlyDead')]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'nearlyDead');
+});
+
+test('an attacker is fought rather than yielded to another player', () => {
+  // Courtesy is about not taking what is someone else's. A monster hitting US is
+  // not a kill we are stealing -- yielding it just means standing still while it
+  // kills us.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10]), other([10, 10])], [attacker([10, 10])]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1');
+});
+
+test('loot at our feet waits until the thing hitting us is dealt with', () => {
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker([10, 10])], [],
+    [drop([10, 10], 'gold', 5)]);
+  run(bot, snap, hunting());
+  assert.equal(stateOf(bot), 'DEFEND');
+  assert.equal(bot.ofType('moveItem').length, 0, 'do not loot mid-mauling');
+});
+
+test('an enraged HUNTED monster is a plain FIGHT, not a DEFEND', () => {
+  // The orc we came for is also the one hitting us. Both selectors return it, so
+  // `defending` must stay false -- otherwise every ordinary fight (prey retaliate
+  // the moment you hit them) would relabel itself as self-defense and the log
+  // would stop distinguishing the two.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker([10, 10], 20, 'orc1', 'orc')]);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'orc1');
+  assert.equal(stateOf(bot), 'FIGHT');
+});
+
+test('the walk to the hunt spot pauses to kill what is chewing on us', () => {
+  // This one keeps travel ON -- it is the point. travelStep only ever yielded for
+  // a HUNTED monster, so something off-type that aggroed on the way used to get a
+  // free escort across the floor, hitting us the whole trip.
+  //
+  // Hunting cave bats (a real underground spot) with an ORC on us: far enough
+  // from the spot that TRAVEL is what would otherwise win this tick.
+  const bot = new FakeBot(backpack([]));
+  bot.z = -1;
+  const spot = farm.huntSpot(bot, cfg({ huntTypes: ['caveBat'] }));
+  const here = [spot.tile[0] + 30, spot.tile[1] + 30];
+  const snap = snapshot([me(here)], [attacker(here, 20, 'orc1', 'orc')]);
+  snap.z = -1;
+  run(bot, snap, { huntTypes: ['caveBat'], cook: false, stack: false });
+  assert.equal(bot.ofType('attack')[0]?.targetId, 'orc1',
+    'must turn and fight rather than walk on being hit');
+  assert.equal(stateOf(bot), 'DEFEND');
+});
+
 test('a dead bot respawns', () => {
   const bot = new FakeBot(backpack([]));
   run(bot, snapshot([me([10, 10], 0)], [rat()]));

@@ -85,6 +85,7 @@ farm flags:
   --no-bank-empty      stop banking at a weight/slot threshold instead of
                        emptying the pack down to food and potions
   --no-courtesy        stop yielding monsters/loot near other players
+  --no-defend          ignore monsters attacking us that aren't the hunted type
   --allies <names>     comma-separated players to treat as ours, not strangers
   --duration <sec>     stop after N seconds (for test runs)
   --quiet              only log state changes
@@ -250,6 +251,7 @@ async function cmdFarm(args) {
     bankFreeSlots: num(args['bank-free'], 1),
     bankEmpty: !args['no-bank-empty'],
     courtesy: !args['no-courtesy'],
+    defend: !args['no-defend'],
     allyNames: args.allies ? String(args.allies).split(',') : [],
   });
   await run(args, (bot, log) => makeFarm(cfg, log));

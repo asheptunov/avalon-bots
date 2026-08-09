@@ -95,6 +95,8 @@ export function createPanel({ onStart, onStop }) {
         <input id="travel" type="checkbox" checked></div>
       <div class="row"><label for="courtesy">avoid other players</label>
         <input id="courtesy" type="checkbox" checked></div>
+      <div class="row"><label for="defend">fight back when attacked</label>
+        <input id="defend" type="checkbox" checked></div>
       <div class="row"><button id="go">Start</button></div>
       <div class="stat"><span>state</span><b id="s-state">idle</b></div>
       <div class="stat"><span>hp</span><b id="s-hp">–</b></div>
@@ -146,6 +148,10 @@ export function createPanel({ onStart, onStop }) {
       // Leave it on unless you know the field is yours -- it is what keeps the
       // bot from looking like it is stealing kills.
       courtesy: $('courtesy').checked,
+      // Swing back at whatever is actually hitting us, hunt filter or not. In a
+      // mixed area (the orc hole is full of bats) a strict hunt filter means
+      // taking the damage without ever answering it.
+      defend: $('defend').checked,
     };
   }
 

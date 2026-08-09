@@ -122,6 +122,42 @@ export function nearestHuntable(snap, anchor, huntTypes, claimed = null) {
   return best || fallback;
 }
 
+// How close an enraged monster must be to count as fighting US rather than
+// something else. The server tells us a monster is enraged but not WHO it is on,
+// so proximity is the only way to pin it to us -- the same read swarm.js makes
+// for the party. Melee-scale plus a tile of slack: an attacker is by mechanics
+// on top of its victim, and the slack absorbs the drift between the position we
+// were sent and where it is by the time we act.
+export const ATTACKER_PX = MELEE_RANGE_PX + TILE;
+
+/**
+ * The nearest monster actively fighting US, whatever its type -- or null.
+ *
+ * This is the multi-enemy-area fix. `huntTypes` governs what we SEEK OUT, not
+ * what we fend off: hunting orcs in the bottom-left hole meant standing in a
+ * room of cave bats being chewed on without ever swinging back, because the bats
+ * failed the type filter and were invisible to prey selection. The bot took the
+ * damage, retreated at retreatFrac, healed, walked back, and got chewed on
+ * again -- an infinite loop that farms nothing.
+ *
+ * Deliberately NOT filtered by `claimed` either. Courtesy is about not taking
+ * what is someone else's; a monster hitting us is not a kill we are stealing, it
+ * is a fight we are already in, and yielding it just means standing still while
+ * it kills us.
+ *
+ * Lowest-HP-first among attackers, matching threatsToParty: when two things are
+ * on us, the one nearest death is the one that stops hitting us soonest.
+ */
+export function nearestAttacker(snap, me, attackerPx = ATTACKER_PX) {
+  let best = null;
+  for (const m of snap.monsters) {
+    if (!(m.hp > 0 && m.enraged)) continue;
+    if (distPx(m.x, m.y, me.x, me.y) > attackerPx) continue;
+    if (!best || m.hp < best.hp) best = m;
+  }
+  return best;
+}
+
 // ---- courtesy: stay out of other players' way ------------------------------
 //
 // The bots share a live server with humans, and a bot that wanders into someone
@@ -383,6 +419,11 @@ export class FarmConfig {
     this.cook = o.cook ?? true;
     this.stack = o.stack ?? true;
     this.huntTypes = o.huntTypes ?? null;
+    // Swing back at whatever is actually hitting us, even when it is not the
+    // type we came to hunt. On by default: a hunt filter that also filters
+    // self-defense means standing still while a bat eats you. See
+    // nearestAttacker.
+    this.defend = o.defend ?? true;
     this.retreatFrac = o.retreatFrac ?? 0.35;
     this.resumeFrac = o.resumeFrac ?? 0.85;
     this.healToFrac = o.healToFrac ?? 0.95;
@@ -1052,7 +1093,17 @@ export function makeFarm(cfg, log) {
     // here: a caveBat hunt on the surface has nothing to select, and roaming for
     // it is what this replaces. travelStep yields the tick the moment a hunted
     // monster is in view, so arriving mid-room starts the fight immediately.
-    if (travelStep(bot, snap, me, cfg, log, spot)) return;
+    //
+    // Skipped while something is actually on us: travelStep only yields for a
+    // HUNTED monster, so a bat that aggroed us on the way to the orc spot would
+    // otherwise get a free escort across the floor, hitting us the whole way. We
+    // are still healthy here (the retreat branch returned above), so turning to
+    // kill it is the cheap outcome -- and it is the only way the trip finishes.
+    //
+    // Scanned once for the tick and reused by the fight branch below, like the
+    // ground scan: this walks every monster in view at 10 Hz.
+    const attacker = cfg.defend ? nearestAttacker(snap, me) : null;
+    if (!attacker && travelStep(bot, snap, me, cfg, log, spot)) return;
 
     if (cfg.depth < 0 && descendStep(bot, me, cfg, log)) return;
 
@@ -1077,7 +1128,27 @@ export function makeFarm(cfg, log) {
         () => `${m.monsterType} is another player's -- moving on`, log);
       m = null;
     }
-    const engaged = m && distPx(m.x, m.y, me.x, me.y) < MELEE_RANGE_PX;
+
+    // --- self-defense overrides the hunt ---------------------------------
+    // Something is hitting us right now. It outranks the hunted target (which
+    // may be across the room), it outranks a YIELD (a monster on us is not a
+    // kill we are stealing), and below it outranks looting -- picking up a
+    // corpse while a bat chews on us is how a full pack turns into a dead bot.
+    // This is the whole multi-enemy-area fix: in a mixed room the type filter
+    // used to make our own attackers invisible.
+    //
+    // Nothing is logged here -- the fight branch below reports it. Logging DEFEND
+    // at this point would be overwritten by that branch's own farmLog a few lines
+    // later, leaving two lines a tick for one decision and the wrong one in
+    // bot.run.farmState.
+    const defending = !!attacker && attacker.id !== m?.id;
+    if (defending) m = attacker;
+
+    // Being attacked counts as engaged even a little outside melee reach: the
+    // attacker is inside ATTACKER_PX, which is deliberately wider, and looting
+    // through those extra few pixels is still looting while something hits us.
+    const engaged = !!attacker
+      || (m && distPx(m.x, m.y, me.x, me.y) < MELEE_RANGE_PX);
     // One ground scan for the whole tick, reused by both loot branches below.
     const loot = cfg.loot ? nearestLoot(bot, snap, me, others) : null;
     if (loot && !engaged && loot.dist <= cfg.lootPx) {
@@ -1089,17 +1160,23 @@ export function makeFarm(cfg, log) {
 
     // --- fight -----------------------------------------------------------
     if (m) {
+      // DEFEND is this same branch under a different name: swinging back at
+      // something that is on us, rather than picking a fight we went looking
+      // for. Worth distinguishing in the log -- "why is my orc bot killing bats"
+      // has an answer, and it should be visible in the run.
+      const state = defending ? 'DEFEND' : 'FIGHT';
       const d = distPx(m.x, m.y, me.x, me.y);
       if (d < MELEE_RANGE_PX) {
         bot.move(0, 0);
         bot.attack(m.id);
         // FIGHT and CHASE are one state for logging: closing the last few px
         // flips between them several times a second.
-        farmLog(bot, 'FIGHT',
-          () => `${m.monsterType} ${m.hp}/${m.maxHp} hp=${me.hp}`, log);
+        farmLog(bot, state,
+          () => `${m.monsterType} ${m.hp}/${m.maxHp} hp=${me.hp}`
+            + (defending ? ' (it attacked us)' : ''), log);
       } else {
         bot.move(...navStep(bot, me, m.x, m.y));
-        farmLog(bot, 'FIGHT',
+        farmLog(bot, state,
           () => `chasing ${m.monsterType} ${(d / TILE).toFixed(1)} tiles`, log);
       }
       return;

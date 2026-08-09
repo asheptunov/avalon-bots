@@ -132,6 +132,31 @@ test('the other toggles still map straight through', () => {
   assert.equal(on.courtesy, true);
 });
 
+// ---- fighting back in mixed areas ------------------------------------------
+//
+// Same class of bug as the travel switch: the behaviour exists in the core and
+// has a CLI flag, but a browser user who cannot reach it has no fix at all for
+// standing in the orc hole being eaten by bats.
+
+test('the defend switch maps through to the config', () => {
+  assert.equal(configFrom({ defend: false }).cfg.defend, false);
+  assert.equal(configFrom({ defend: true }).cfg.defend, true);
+});
+
+test('the panel offers the fight-back switch, on by default', () => {
+  // On by default IS the fix -- off is the reported bug (hunting orcs while bats
+  // chew on you and the bot never swings back).
+  const src = readFileSync(new URL('../src/ui.js', import.meta.url), 'utf8');
+  assert.match(src, /<input id="defend" type="checkbox" checked>/,
+    'defend needs its own checkbox, ticked by default');
+});
+
+test('the built userscript carries the fight-back checkbox', () => {
+  const code = readFileSync(BUNDLE, 'utf8');
+  assert.match(code, /<input id="defend" type="checkbox" checked>/,
+    'bundle is stale: no defend checkbox -- run `node build.mjs`');
+});
+
 test('the panel offers the avoid-other-players switch, on by default', () => {
   // Browser users have no CLI flags, so if the panel never renders this the
   // behaviour is unreachable and unturnoffable from the only UI they have.
