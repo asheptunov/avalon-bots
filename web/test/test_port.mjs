@@ -527,3 +527,88 @@ test('untilHpFrac stops the loop', () => {
   runTick(bot, snap, { untilHpFrac: 0.5, cook: false, stack: false });
   assert.equal(bot.done, true);
 });
+
+// ---- self-defense: driven by combat events, NOT the enraged flag -----------
+//
+// These exist because the first version of DEFEND shipped broken and every
+// policy test passed. It read the snapshot's `enraged` flag, on the assumption
+// that the server sets it on a monster fighting you. It does not.
+//
+// Measured live in the orc cave: an orc hit Dario ~100 times, taking him from
+// 199 HP to 20, and `enraged` was false in every snapshot of it. The policy
+// tests fed hand-written `enraged: true` monsters the server never sends, so
+// they proved nothing about production.
+//
+// That is exactly the class of bug this file exists to catch, so the fix is
+// pinned HERE, against real frames, not against literal objects.
+
+/** A server combat-event frame (opcode 2). */
+function combatEvent({ attackerId, targetId, damage = 3, targetHpAfter = 50, targetMaxHp = 100, flags = 0 }) {
+  return new W().u8(2).str(attackerId).str(targetId)
+    .u16(damage).u16(targetHpAfter).u16(targetMaxHp).u8(flags).buf();
+}
+
+test('a combat event naming us as target records the attacker', () => {
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'orc-9', targetId: 'me' }));
+  assert.equal(bot.isAttacking('orc-9'), true);
+});
+
+test('a combat event between two OTHER parties is not our fight', () => {
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'orc-9', targetId: 'someone-else' }));
+  assert.equal(bot.isAttacking('orc-9'), false);
+});
+
+test('a miss (damage=0) still counts as being attacked', () => {
+  // The live capture is full of dmg=0 events. A monster swinging and missing is
+  // still a monster fighting us.
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'orc-9', targetId: 'me', damage: 0 }));
+  assert.equal(bot.isAttacking('orc-9'), true);
+});
+
+test('an off-type monster that HIT us is fought back, from real frames', () => {
+  // The whole bug, end to end: hunting orcs, a cave bat hits us, and the bot
+  // must swing back. No `enraged` anywhere -- the frames say what the server
+  // actually says.
+  const bot = withBackpack(makeBot(), [null]);
+  bot.stats = { statusEffects: [{ kind: 'wellFed' }] };
+  bot.onBinary(combatEvent({ attackerId: 'bat-1', targetId: 'me' }));
+  const snap = decodeSnapshot(snapshot({
+    players: [player({ x: 100, y: 100 })],
+    // type 1 = caveBat, and enraged is FALSE, as the real server sends it.
+    monsters: [{ id: 'bat-1', type: 1, x: 100, y: 100, hp: 22, maxHp: 22, enraged: false }],
+    ground: [],
+  }));
+  runTick(bot, snap, { huntTypes: ['orc'], travel: false, cook: false, stack: false });
+  const attacked = bot.sent.some(
+    (s) => s instanceof ArrayBuffer && new Uint8Array(s)[0] === 2);
+  assert.ok(attacked, 'must fight back at the bat that hit us');
+});
+
+test('the enraged flag alone does NOT trigger self-defense', () => {
+  // The inverse, and the one that pins the lesson: enraged is not the signal.
+  // A monster flagged enraged that has never hit us is not our fight -- if this
+  // ever starts passing by way of the flag, the old bug is back.
+  const bot = withBackpack(makeBot(), [null]);
+  bot.stats = { statusEffects: [{ kind: 'wellFed' }] };
+  const snap = decodeSnapshot(snapshot({
+    players: [player({ x: 100, y: 100 })],
+    monsters: [{ id: 'bat-1', type: 1, x: 100, y: 100, hp: 22, maxHp: 22, enraged: true }],
+    ground: [],
+  }));
+  runTick(bot, snap, { huntTypes: ['orc'], travel: false, cook: false, stack: false });
+  const attacked = bot.sent.some(
+    (s) => s instanceof ArrayBuffer && new Uint8Array(s)[0] === 2);
+  assert.equal(attacked, false, 'enraged is not evidence it is fighting US');
+});
+
+test('a stale attacker is forgotten once its memory window lapses', () => {
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'orc-9', targetId: 'me' }));
+  // Backdate the hit well past ATTACKER_MEMORY_S.
+  bot.attackedBy.set('orc-9', bot._now() - 999);
+  assert.equal(bot.isAttacking('orc-9'), false);
+  assert.equal(bot.attackedBy.has('orc-9'), false, 'and the entry is pruned');
+});

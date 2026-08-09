@@ -122,16 +122,17 @@ export function nearestHuntable(snap, anchor, huntTypes, claimed = null) {
   return best || fallback;
 }
 
-// How close an enraged monster must be to count as fighting US rather than
-// something else. The server tells us a monster is enraged but not WHO it is on,
-// so proximity is the only way to pin it to us -- the same read swarm.js makes
-// for the party. Melee-scale plus a tile of slack: an attacker is by mechanics
-// on top of its victim, and the slack absorbs the drift between the position we
-// were sent and where it is by the time we act.
-export const ATTACKER_PX = MELEE_RANGE_PX + TILE;
+// How far a monster that has hit us can be and still count as OUR fight.
+//
+// Wider than melee on purpose: it is a leash, not a reach test. The combat event
+// already proved the monster is on us; this only stops it staying "ours" after
+// we have genuinely left -- a monster that lost us and went home should not keep
+// pulling the bot back for the rest of the memory window. Chases cover ground
+// between snapshots, so a melee-tight bound here would flicker mid-fight.
+export const ATTACKER_PX = TILE * 6;
 
 /**
- * The nearest monster actively fighting US, whatever its type -- or null.
+ * The monster currently fighting US, whatever its type -- or null.
  *
  * This is the multi-enemy-area fix. `huntTypes` governs what we SEEK OUT, not
  * what we fend off: hunting orcs in the bottom-left hole meant standing in a
@@ -140,18 +141,32 @@ export const ATTACKER_PX = MELEE_RANGE_PX + TILE;
  * damage, retreated at retreatFrac, healed, walked back, and got chewed on
  * again -- an infinite loop that farms nothing.
  *
- * Deliberately NOT filtered by `claimed` either. Courtesy is about not taking
- * what is someone else's; a monster hitting us is not a kill we are stealing, it
- * is a fight we are already in, and yielding it just means standing still while
- * it kills us.
+ * WHO is attacking us comes from combat events (bot.attackedBy), NOT from the
+ * snapshot. The first version of this read the snapshot's `enraged` flag, on the
+ * assumption -- inherited from swarm.js -- that the server sets it on a monster
+ * in a fight. It does not. Measured live: an orc hit Dario ~100 times, 199 HP
+ * down to 20, and `enraged` was false in every single snapshot. That version
+ * passed every test and did nothing whatsoever in production, because the tests
+ * fed it hand-written `enraged: true` monsters the real server never sends.
  *
- * Lowest-HP-first among attackers, matching threatsToParty: when two things are
- * on us, the one nearest death is the one that stops hitting us soonest.
+ * Proximity is still required, but only as a sanity bound: it stops a monster we
+ * have run away from staying "our attacker" for the memory window while we are
+ * across the room. The event is what makes it ours; the distance only says it
+ * still is.
+ *
+ * Deliberately NOT filtered by `claimed`. Courtesy is about not taking what is
+ * someone else's; a monster hitting us is not a kill we are stealing, it is a
+ * fight we are already in, and yielding it just means standing still while it
+ * kills us.
+ *
+ * Lowest-HP-first among attackers: when two things are on us, the one nearest
+ * death is the one that stops hitting us soonest.
  */
-export function nearestAttacker(snap, me, attackerPx = ATTACKER_PX) {
+export function nearestAttacker(bot, snap, me, attackerPx = ATTACKER_PX) {
   let best = null;
   for (const m of snap.monsters) {
-    if (!(m.hp > 0 && m.enraged)) continue;
+    if (m.hp <= 0) continue;
+    if (!bot.isAttacking(m.id)) continue;
     if (distPx(m.x, m.y, me.x, me.y) > attackerPx) continue;
     if (!best || m.hp < best.hp) best = m;
   }
@@ -1102,7 +1117,7 @@ export function makeFarm(cfg, log) {
     //
     // Scanned once for the tick and reused by the fight branch below, like the
     // ground scan: this walks every monster in view at 10 Hz.
-    const attacker = cfg.defend ? nearestAttacker(snap, me) : null;
+    const attacker = cfg.defend ? nearestAttacker(bot, snap, me) : null;
     if (!attacker && travelStep(bot, snap, me, cfg, log, spot)) return;
 
     if (cfg.depth < 0 && descendStep(bot, me, cfg, log)) return;

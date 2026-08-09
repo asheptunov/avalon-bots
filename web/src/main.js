@@ -121,6 +121,11 @@ function boot() {
     bot.run = {};
     bot.fleeing = false;
     bot.done = false;
+    // Who hit us lives on the bot, not in `run` (onBinary records it outside any
+    // farm tick), so the reset above does not reach it. Clear it too, or a
+    // restart inherits the last run's attacker and opens with a DEFEND on
+    // something that stopped swinging minutes ago.
+    bot.attackedBy.clear();
     const cfg = new FarmConfig(opts);
     intent = makeFarm(cfg, log);
     panel.setRunning(true);

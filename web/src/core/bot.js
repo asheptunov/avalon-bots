@@ -11,8 +11,19 @@
 // them harmlessly, which keeps the ported logic identical to read.
 
 import {
-  decodeSnapshot, encodeMove, encodeAttack, SRV_SNAPSHOT,
+  decodeSnapshot, decodeCombatEvent, encodeMove, encodeAttack,
+  SRV_SNAPSHOT, SRV_COMBAT_EVENT,
 } from './protocol.js';
+
+/**
+ * How long a monster stays "on us" after its last landed hit.
+ *
+ * Attacks arrive about once a second, so this has to span several swings or the
+ * bot would forget its attacker between blows and flip back to hunting. Long
+ * enough to survive a miss (damage=0 events are real and frequent), short enough
+ * that walking away from a leashed monster ends the fight.
+ */
+export const ATTACKER_MEMORY_S = 6.0;
 
 export class AvalonBot {
   constructor(send) {
@@ -30,6 +41,15 @@ export class AvalonBot {
     this.groundItems = [];   // last known floor contents (see onBinary)
     this.z = null;
     this.fleeing = false;
+    // monsterId -> timestamp (seconds) of the last hit it landed on us.
+    //
+    // This is the ONLY reliable "who is attacking me" signal the server gives.
+    // The snapshot's `enraged` flag is NOT it: measured live in the orc cave, an
+    // orc hit us ~100 times, taking us from 199 to 20 HP, and never once came
+    // through with enraged set. Anything keying self-defense off that flag is
+    // dead code in production, however well it tests against hand-made
+    // snapshots. See onBinary.
+    this.attackedBy = new Map();
     this.equipment = {};     // slot -> item (from welcome/equipmentUpdate)
     this.stats = {};         // authoritative stats from welcome/playerStats
     this.done = false;
@@ -220,9 +240,37 @@ export class AvalonBot {
       this.state = snap;
       return snap;
     }
-    // Combat events and death notices carry nothing the farm loop needs -- it
-    // reads hp straight off the snapshot. Decoded here only so an unrecognised
-    // opcode stays distinguishable from one we deliberately ignore.
+    // Combat events are how we learn WHO is hitting us -- the snapshot cannot
+    // tell us (see attackedBy). Note a damage=0 event still counts: a miss is a
+    // monster swinging at us, which is exactly the thing we want to answer.
+    if (op === SRV_COMBAT_EVENT) {
+      const ev = decodeCombatEvent(buf);
+      if (ev.targetId === this.me && ev.attackerId) {
+        this.attackedBy.set(ev.attackerId, this._now());
+      }
+      return null;
+    }
+    // Death notices carry nothing the farm loop needs -- it reads hp straight
+    // off the snapshot. Falling through keeps an unrecognised opcode
+    // distinguishable from one we deliberately ignore.
     return null;
+  }
+
+  /** Seconds, on the same clock farm.js uses. Overridable in tests. */
+  _now() { return performance.now() / 1000; }
+
+  /**
+   * True if `monsterId` has hit us within `withinS`.
+   *
+   * Prunes as it goes: a long run in a busy cave would otherwise accumulate an
+   * entry per monster that ever landed a blow, and every one of them gets tested
+   * on every tick.
+   */
+  isAttacking(monsterId, withinS = ATTACKER_MEMORY_S) {
+    const at = this.attackedBy.get(monsterId);
+    if (at === undefined) return false;
+    if (this._now() - at <= withinS) return true;
+    this.attackedBy.delete(monsterId);
+    return false;
   }
 }

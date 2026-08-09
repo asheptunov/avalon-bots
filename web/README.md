@@ -67,17 +67,31 @@ threshold, healed, walked back, and got chewed on again — a loop that farms
 nothing.
 
 The rule now is the one the swarm already used for the party: **`hunt` governs
-what the bot seeks out, not what it fends off.** A monster that is `enraged` and
-within about a tile of melee reach is by game mechanics fighting *us*, so it gets
-answered whatever its type. That target beats the hunted monster across the room,
-beats looting, and pauses the walk to the hunting ground — all three otherwise
-mean taking free hits.
+what the bot seeks out, not what it fends off.** Anything that has actually hit us
+gets answered whatever its type. That target beats the hunted monster across the
+room, beats looting, and pauses the walk to the hunting ground — all three
+otherwise mean taking free hits.
+
+**The signal is combat events, not the snapshot.** This is worth stating plainly
+because the first version of this feature got it wrong and shipped broken. It read
+the snapshot's `enraged` flag, assuming the server sets it on a monster that is
+fighting you. It does not. Measured live in the orc cave: an orc hit Dario about a
+hundred times, taking him from 199 HP to 20, and `enraged` was false in every
+single snapshot of it. The flag appears to mean something else entirely.
+
+What the server *does* tell you is `SRV_COMBAT_EVENT`, which carries
+`attackerId`/`targetId` — so `bot.attackedBy` records who hit us and when, and a
+monster stays "ours" for `ATTACKER_MEMORY_S` (6s) after its last swing. That
+window matters: blows land about once a second and the loop ticks at 10 Hz, so a
+signal that lasted one tick would have the bot swinging on the hit tick and
+wandering back to the hunt on the nine after it. Misses (`damage=0`) count too —
+a monster swinging and missing is still fighting us.
 
 It deliberately does **not** widen what the bot picks fights with. An off-type
-monster standing idle is still left alone, and so is an enraged one mauling
-somebody else across the room — `enraged` says "in a fight", not "in a fight with
-you", so proximity is what makes it ours. It also overrides the courtesy yield: a
-monster hitting us is not a kill being stolen.
+monster that has not hit us is left alone, and one we have outrun (past six tiles)
+stops being ours, so walking away ends the fight rather than tethering us to it.
+It also overrides the courtesy yield: a monster hitting us is not a kill being
+stolen.
 
 The issue that prompted this asked whether fleeing from higher-tier enemies would
 be safer. It is already what happens, and by a better trigger than monster type:

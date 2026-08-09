@@ -160,9 +160,24 @@ test('the hunt filter refuses a fight with the 16k-HP training dummy', () => {
 // The rule these pin down is the one swarm.js already settled for the party:
 // huntTypes governs what we SEEK OUT, not what we fend off.
 
-/** A monster mid-fight with us: enraged and on top of us. */
-const attacker = (tile = [10, 10], hp = 20, mid = 'bat1', mtype = 'caveBat') =>
-  ({ ...rat(tile, hp, mid, mtype), enraged: true });
+/**
+ * A monster that has just hit us.
+ *
+ * The bot learns this from COMBAT EVENTS, not the snapshot -- so this marks the
+ * bot, not the monster. That distinction is the whole bug: the first version of
+ * this feature keyed off the snapshot's `enraged` flag, these fixtures set
+ * `enraged: true`, every test passed, and the feature did nothing in production
+ * because the real server never sets that flag on a monster fighting you.
+ * Measured live in the orc cave: ~100 hits, 199 HP to 20, `enraged` false
+ * throughout.
+ *
+ * So: build the monster, and tell the bot it was hit by it, the way the wire
+ * would. `attackedBy` is what nearestAttacker actually reads.
+ */
+const attacker = (bot, tile = [10, 10], hp = 20, mid = 'bat1', mtype = 'caveBat') => {
+  bot.attackedBy.set(mid, bot._now());
+  return rat(tile, hp, mid, mtype);
+};
 
 /**
  * Hunt orcs right here, without the trip.
@@ -178,7 +193,7 @@ const hunting = (o = {}) =>
 
 test('a bat attacking us is fought back even while hunting orcs', () => {
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10])], [attacker([10, 10])]);
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1',
     'the hunt filter must not make our own attacker invisible');
@@ -191,24 +206,48 @@ test('an idle off-type monster is still left alone', () => {
   const bot = new FakeBot(backpack([]));
   const snap = snapshot([me([10, 10])], [rat([10, 10], 20, 'bat1', 'caveBat')]);
   run(bot, snap, hunting());
-  assert.equal(bot.ofType('attack').length, 0, 'not enraged -- not our fight');
+  assert.equal(bot.ofType('attack').length, 0, 'it never hit us -- not our fight');
   assert.equal(stateOf(bot), 'ROAM');
 });
 
-test('an enraged monster across the room is not our fight', () => {
-  // Enraged pins down "in a fight", not "in a fight with US" -- the server never
-  // says whose. Proximity is the only thing that makes it ours, so a bat mauling
-  // someone else 15 tiles away must not pull us off the hunt.
+test('a monster we have outrun stops being our fight', () => {
+  // The leash half of the rule. The combat event is what makes a monster ours,
+  // but it must not keep us tethered to something 15 tiles behind us for the
+  // whole memory window -- otherwise walking away re-targets it forever.
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10])], [attacker([25, 10])]);
+  const snap = snapshot([me([10, 10])], [attacker(bot, [25, 10])]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack').length, 0);
   assert.notEqual(stateOf(bot), 'DEFEND');
 });
 
+test('its hit is remembered across ticks, not just the one it landed on', () => {
+  // Attacks land about once a second and the loop ticks at 10 Hz, so a signal
+  // that only survived its own tick would flicker: the bot would swing on the
+  // hit tick and wander back to the hunt on the nine after it. This is what
+  // ATTACKER_MEMORY_S is for.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  for (let i = 0; i < 5; i++) run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack').at(-1)?.targetId, 'bat1',
+    'still our fight several ticks after the blow');
+});
+
+test('an attacker is forgotten once it has stopped hitting us', () => {
+  // The other end of the memory: a monster that gave up (or that we killed and
+  // whose id got reused) must not stay our target forever.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  // Backdate the hit past the memory window.
+  bot.attackedBy.set('bat1', bot._now() - 999);
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack').length, 0, 'stale hit must not re-target it');
+  assert.equal(bot.attackedBy.has('bat1'), false, 'and the entry is pruned');
+});
+
 test('--no-defend restores the old ignore-everything-off-type behaviour', () => {
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10])], [attacker([10, 10])]);
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
   run(bot, snap, hunting({ defend: false }));
   assert.equal(bot.ofType('attack').length, 0);
 });
@@ -227,7 +266,7 @@ test('being attacked outranks the hunted monster across the room', () => {
   // orc means eating hits the whole way and arriving hurt.
   const bot = new FakeBot(backpack([]));
   const snap = snapshot([me([10, 10])],
-    [rat([18, 10], 20, 'orc1', 'orc'), attacker([10, 10])]);
+    [rat([18, 10], 20, 'orc1', 'orc'), attacker(bot, [10, 10])]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1');
 });
@@ -237,7 +276,7 @@ test('two attackers: the one nearest death is finished first', () => {
   // us soonest.
   const bot = new FakeBot(backpack([]));
   const snap = snapshot([me([10, 10])],
-    [attacker([10, 10], 18, 'healthy'), attacker([10, 10], 3, 'nearlyDead')]);
+    [attacker(bot, [10, 10], 18, 'healthy'), attacker(bot, [10, 10], 3, 'nearlyDead')]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack')[0]?.targetId, 'nearlyDead');
 });
@@ -247,14 +286,14 @@ test('an attacker is fought rather than yielded to another player', () => {
   // not a kill we are stealing -- yielding it just means standing still while it
   // kills us.
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10]), other([10, 10])], [attacker([10, 10])]);
+  const snap = snapshot([me([10, 10]), other([10, 10])], [attacker(bot, [10, 10])]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack')[0]?.targetId, 'bat1');
 });
 
 test('loot at our feet waits until the thing hitting us is dealt with', () => {
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10])], [attacker([10, 10])], [],
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])], [],
     [drop([10, 10], 'gold', 5)]);
   run(bot, snap, hunting());
   assert.equal(stateOf(bot), 'DEFEND');
@@ -267,7 +306,7 @@ test('an enraged HUNTED monster is a plain FIGHT, not a DEFEND', () => {
   // the moment you hit them) would relabel itself as self-defense and the log
   // would stop distinguishing the two.
   const bot = new FakeBot(backpack([]));
-  const snap = snapshot([me([10, 10])], [attacker([10, 10], 20, 'orc1', 'orc')]);
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10], 20, 'orc1', 'orc')]);
   run(bot, snap, hunting());
   assert.equal(bot.ofType('attack')[0]?.targetId, 'orc1');
   assert.equal(stateOf(bot), 'FIGHT');
@@ -284,7 +323,7 @@ test('the walk to the hunt spot pauses to kill what is chewing on us', () => {
   bot.z = -1;
   const spot = farm.huntSpot(bot, cfg({ huntTypes: ['caveBat'] }));
   const here = [spot.tile[0] + 30, spot.tile[1] + 30];
-  const snap = snapshot([me(here)], [attacker(here, 20, 'orc1', 'orc')]);
+  const snap = snapshot([me(here)], [attacker(bot, here, 20, 'orc1', 'orc')]);
   snap.z = -1;
   run(bot, snap, { huntTypes: ['caveBat'], cook: false, stack: false });
   assert.equal(bot.ofType('attack')[0]?.targetId, 'orc1',
