@@ -8,6 +8,45 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## 2026-08-08 — the depot sees through nested bags (#5)
+
+**The bank was full long before it was full.** A depot box has a fixed slot
+count, and `bankStep` addressed every `moveItem` at the box's own `instanceId`.
+So once the top level was occupied the trip deposited nothing and the bot walked
+back out with the same full pack — even when the box held bags with plenty of
+room inside them. Backpacks are containers, and a backpack inside a backpack is
+more storage again; Dario's depot is already a depth-2 chain.
+
+`depotSlot(depot)` now picks the destination container instead of assuming the
+box, and `moveItem` is addressed to whatever it returns.
+
+- **Breadth-first, deliberately.** Fill the box's own slots, then a bag at depth
+  1, then depth 2. Depth-first would bury the first dagger of the run at the
+  bottom of the deepest chain while a sibling bag sat empty — storage nobody can
+  read when they open the box.
+- **Nesting does not create capacity.** Each bag still costs a slot in its
+  parent and the game still charges its weight (`backpack` 5oz, `largeBackpack`
+  7oz, `adventurersBackpack` 4oz). What it buys is that a full-looking box is
+  rarely actually full.
+- **An empty spare bag is now haul.** The old rule skipped every container in the
+  pack, which made it impossible for the bot to ever *set up* the nesting. Empty
+  bags get stowed (that is what grows the depot); a bag with anything in it is
+  storage the player arranged, and stays.
+- **Corpses are excluded.** An empty corpse in the bank looks exactly like a
+  spare bag, and it despawns with the haul inside.
+- **A genuinely full nest ends the trip** with a log line, instead of re-offering
+  the same item until the 90 s timeout.
+- The "depot open (n/m slots used)" line counts through the nesting now — the
+  top-level number is a lie once the box holds bags, and this is the figure you
+  use to decide whether to buy another backpack.
+
+Bounded at depth 8 with a `seen` set: the depot structure comes from the server,
+and an unbounded walk over a cycle would spin the tick rather than fail loudly.
+
+293 tests (14 new). **Not yet live-tested** — see the open item below.
+
+---
+
 ## 2026-08-08 — the bot goes to where its prey lives (#4)
 
 **The bug.** Pick "caveBat" on floor 0 and the bot roamed the surface forever.
@@ -453,6 +492,19 @@ regen.
 ## Open items
 
 Next up:
+
+- **Live-smoke-test nested depot banking (#5)** — the search is unit-tested but
+  the server's rules are not readable offline. Two unknowns: does the server
+  accept a `moveItem` addressed to a container that is itself inside the depot
+  (the whole feature rests on this), and is there a nesting depth it refuses?
+  Dario's depth-2 chain says 2 is fine.
+  - Still open on #5, deliberately not built: **buying backpacks from
+    Quartermaster Wren**. The protocol is confirmed in the bundle (`openShop
+    {npcId}` → `{buy:[{itemId,price}],sell:[…]}` → `buyItem {npcId,itemId,
+    quantity}`, shopkeepers are npcType `merchant`/`smith`), but Wren is
+    server-side data — not in the bundle — so the NPC, the stock and the price
+    can only be confirmed live. It also spends the character's gold.
+  - Also open: **sorting loot by category** into a designated bag.
 
 - **Live-smoke-test `farm`** — the whole loop is unit-tested but has never run
   against the server. Watch for: does `moveItem` from the ground actually pick

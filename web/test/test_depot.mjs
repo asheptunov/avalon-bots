@@ -390,12 +390,44 @@ test('equipped gear is never banked', () => {
   assert.ok(!seen.has('armor'));
 });
 
-test('a nested bag is storage, not haul', () => {
+test('a bag with something in it is storage, not haul', () => {
+  // The rule that protects the player's own arrangement: a bag we are carrying
+  // with anything inside stays put, so a trip can never quietly bank the kit
+  // somebody deliberately packed.
   const bot = new FakeBot(backpack([
-    item('largeBackpack', 1, 'bag2', [null, null]), item('dagger', 1, 'junk1'),
+    item('largeBackpack', 1, 'bag2', [item('cookedMeat', 5, 'stash'), null]),
+    item('dagger', 1, 'junk1'),
+  ]));
+  const seen = new Set();
+  for (let i = 0; i < 5; i++) {
+    const n = depot.nextDeposit(bot);
+    if (!n) break;
+    seen.add(n.item.instanceId);
+    const pack = bot.backpack();
+    pack.contents = pack.contents.map(
+      (c) => (c && c.instanceId === n.item.instanceId ? null : c));
+  }
+  assert.ok(seen.has('junk1'), 'the loose junk is still haul');
+  assert.ok(!seen.has('bag2'), 'a bag holding something must not be banked');
+});
+
+test('an EMPTY spare bag is haul -- it is what grows the depot', () => {
+  // The other half of the split. Stowing an empty spare is precisely how a full
+  // box gains another bag's worth of slots, so refusing to bank it (the old
+  // blanket skip) made the nesting impossible to set up from the bot.
+  const bot = new FakeBot(backpack([
+    item('largeBackpack', 1, 'spare', [null, null, null]),
   ]));
   const next = depot.nextDeposit(bot);
-  assert.equal(next.item.instanceId, 'junk1');
+  assert.ok(next, 'an empty bag should be depositable');
+  assert.equal(next.item.instanceId, 'spare');
+});
+
+test('a corpse in the pack is never treated as spare storage', () => {
+  // isContainer excludes corpses: an empty one would otherwise look exactly
+  // like a spare backpack, and the depot would end up holding a corpse.
+  const bot = new FakeBot(backpack([item('corpse', 1, 'body', [null, null])]));
+  assert.equal(depot.nextDeposit(bot), null, 'a corpse is not haul and not storage');
 });
 
 // ---- finishing ------------------------------------------------------------
@@ -507,4 +539,133 @@ test('unrelated JSON is ignored', () => {
   const bot = new FakeBot(junk(8));
   assert.equal(depot.handleDepot(bot, { type: 'playerStats' }, () => {}), false);
   assert.ok(!bot.run.depotOpen);
+});
+
+// ---- nested bags ----------------------------------------------------------
+//
+// The depot box is a container whose slots can hold BAGS, and those bags hold
+// items -- so a box reporting every slot occupied is usually not out of room at
+// all. These pin the search that finds the real free slot, because the failure
+// is quiet: without it the bot walks to a "full" bank, deposits nothing, and
+// goes back out with the same full pack, forever.
+
+/** A container with `contents` padded out to `cap` slots. */
+const bag = (iid, contents = [], cap = 4, itemId = 'backpack') => {
+  const slots = [...contents];
+  while (slots.length < cap) slots.push(null);
+  return item(itemId, 1, iid, slots);
+};
+
+/** A container with every slot occupied. */
+const fullBag = (iid, cap = 4, itemId = 'backpack') =>
+  item(itemId, 1, iid, Array.from({ length: cap }, (_, i) => item('rock', 1, `${iid}-r${i}`)));
+
+test('with room at the top level, the box itself is the destination', () => {
+  // The pre-nesting behaviour has to be exactly preserved: the common case is a
+  // box that is not full, and it must not start burying things in bags.
+  const box = bag('depot-box', [item('gold', 5, 'g')], 10, 'depot');
+  assert.equal(depot.depotSlot(box).instanceId, 'depot-box');
+});
+
+test('a full box with a bag in it deposits INTO the bag', () => {
+  // The whole point of the issue: this box has no free slot of its own, but it
+  // is nowhere near full.
+  const inner = bag('inner', [], 4);
+  const box = item('depot', 1, 'depot-box',
+    [inner, item('rock', 1, 'r1'), item('rock', 1, 'r2')]);
+  assert.equal(depot.depotSlot(box).instanceId, 'inner');
+});
+
+test('depth 2 -- a bag inside a bag, which is how Dario has his', () => {
+  // The arrangement the issue points at. The outer bag is full, so the free slot
+  // is one level deeper again.
+  const deep = bag('deep', [], 4);
+  const outer = item('backpack', 1, 'outer',
+    [deep, item('rock', 1, 'x1'), item('rock', 1, 'x2'), item('rock', 1, 'x3')]);
+  const box = item('depot', 1, 'depot-box', [outer, item('rock', 1, 'r1')]);
+  assert.equal(depot.depotSlot(box).instanceId, 'deep');
+});
+
+test('the search is breadth-first, so the haul stays as shallow as it can', () => {
+  // Ordering is policy, not an accident. A depth-first walk would descend into
+  // the first bag and bury a dagger three levels down while a sibling bag at
+  // depth 1 sat empty -- storage a human can no longer read.
+  const deepInner = bag('deep-inner', [], 4);
+  const deepOuter = item('backpack', 1, 'deep-outer',
+    [deepInner, item('rock', 1, 'd1'), item('rock', 1, 'd2'), item('rock', 1, 'd3')]);
+  const shallow = bag('shallow', [], 4);
+  // deepOuter comes FIRST, so a depth-first search would find deep-inner.
+  const box = item('depot', 1, 'depot-box', [deepOuter, shallow]);
+  assert.equal(depot.depotSlot(box).instanceId, 'shallow',
+    'the depth-1 bag must win over a depth-2 one');
+});
+
+test('a genuinely full nest returns nothing rather than looping', () => {
+  const box = item('depot', 1, 'depot-box', [fullBag('b1'), fullBag('b2')]);
+  assert.equal(depot.depotSlot(box), null);
+});
+
+test('a corpse in the depot is not filled up', () => {
+  // An empty corpse in the bank looks exactly like a spare bag. Putting the haul
+  // in one is funny right up until it despawns.
+  const box = item('depot', 1, 'depot-box',
+    [item('corpse', 1, 'body', [null, null]), item('rock', 1, 'r')]);
+  assert.equal(depot.depotSlot(box), null, 'the corpse must not count as storage');
+});
+
+test('a container cycle cannot hang the tick', () => {
+  // The depot structure comes from the server, so this walk is over data we do
+  // not control. A cycle has never been sent; an unbounded search over one would
+  // spin forever rather than fail, which is the worst way to find out.
+  const a = item('backpack', 1, 'a', []);
+  const b = item('backpack', 1, 'b', [a]);
+  a.contents = [b];                                  // a -> b -> a
+  const box = item('depot', 1, 'depot-box', [a, item('rock', 1, 'r')]);
+  assert.equal(depot.depotSlot(box), null);
+});
+
+test('free-slot counting sees through the nesting', () => {
+  // The number a human uses to decide whether to buy another backpack. Counting
+  // only the box's own slots would report a full bank while bags inside it sit
+  // empty.
+  const box = item('depot', 1, 'depot-box', [bag('inner', [], 4), item('rock', 1, 'r')]);
+  const [free, cap] = depot.depotFree(box);
+  // 2 box slots (both used) + 4 inner slots (all free).
+  assert.equal(cap, 6);
+  assert.equal(free, 4);
+});
+
+test('the deposit is addressed to the nested bag, not the box', () => {
+  // End to end through the real loop: the moveItem the server receives must name
+  // the inner container, because addressing the full box is what the server
+  // refuses.
+  const bot = new FakeBot(junk(8));
+  const snap = snapshot([me([74, 40])], []);
+  pump(bot, snap, {}, 20, (b) => b.ofType('openDepot').length > 0);
+  // A box with no free slot of its own, holding one empty bag.
+  depot.handleDepot(bot, {
+    type: 'depotUpdate',
+    depot: item('depot', 1, 'depot-box', [bag('inner', [], 6), item('rock', 1, 'r')]),
+  }, () => {});
+  pump(bot, snap, {}, 20, (b) => b.ofType('moveItem').length > 0);
+  const mv = bot.ofType('moveItem')[0];
+  assert.ok(mv, 'a deposit should have been sent');
+  assert.equal(mv.to.containerInstanceId, 'inner',
+    'must deposit into the nested bag, not the full box');
+});
+
+test('a full depot ends the trip instead of retrying forever', () => {
+  // Without the check the bot re-offers the same item until the 90 s timeout,
+  // standing at a bank that cannot take it.
+  const bot = new FakeBot(junk(8));
+  const snap = snapshot([me([74, 40])], []);
+  pump(bot, snap, {}, 20, (b) => b.ofType('openDepot').length > 0);
+  depot.handleDepot(bot, {
+    type: 'depotUpdate', depot: item('depot', 1, 'depot-box', [fullBag('b1')]),
+  }, () => {});
+  pump(bot, snap, {}, 60, (b) => !b.run.banking);
+  assert.ok(!bot.run.banking, 'the trip must end');
+  assert.equal(bot.ofType('moveItem').length, 0, 'and deposit nothing');
+  assert.ok(logs.some((m) => /depot is full/.test(m)),
+    `expected a full-depot log, got ${logs}`);
 });

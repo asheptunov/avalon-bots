@@ -25,6 +25,17 @@
 // The one rule that is ours rather than the game's: we stow the haul but keep
 // the consumables. A bot that banks its food and potions walks back out unable
 // to regenerate, and that is a slower death than a full backpack.
+//
+// NESTED BAGS. A depot box holds a fixed number of slots, and once they are all
+// occupied the trip ends with the haul still in the pack. But a backpack stored
+// IN the box is itself a container, so its slots are storage too -- and a bag
+// inside that bag is more storage again. Nesting does not create capacity out of
+// nothing (each bag still costs a slot in its parent, and the game charges its
+// weight), but it does mean a full-looking box is rarely actually full: six
+// boxes of bags-in-bags is enough storage that we stop worrying about the cap.
+// `depotSlot` is what makes the box's own nested bags usable -- it picks the
+// destination container instead of assuming the box's top level, so the deposit
+// goes wherever there is genuinely room.
 
 import { TILE } from './protocol.js';
 import { distPx, navStep, farmLog } from './farm.js';
@@ -134,8 +145,14 @@ const KEEP_QUANTITY = {
  *
  * Walks the backpack's own slots rather than `iterItems()` so equipped gear is
  * never a candidate: `iterItems` recurses through equipment, and banking the
- * sword we are fighting with would be a memorable bug. Nested containers are
- * skipped for the same reason -- a bag inside the bag is storage, not haul.
+ * sword we are fighting with would be a memorable bug.
+ *
+ * A bag carried in the pack is haul only when it is EMPTY. That split is the
+ * point of the nesting work: an empty spare is exactly what the depot wants --
+ * stowing it is what turns one full box into a box with another bag's worth of
+ * slots inside it -- while a bag with anything in it is storage the player
+ * arranged deliberately, and emptying our own kit into the bank by accident is
+ * the bug the old blanket skip was protecting against.
  */
 export function nextDeposit(bot, keepQty = KEEP_QUANTITY) {
   const pack = bot.backpack();
@@ -155,8 +172,16 @@ export function nextDeposit(bot, keepQty = KEEP_QUANTITY) {
   }
 
   for (const it of contents) {
-    if (!it || it.contents != null) continue;      // empty slot, or a bag
+    if (!it) continue;                             // empty slot
     if (skip?.has(it.instanceId)) continue;        // already refused this trip
+    if (it.contents != null) {
+      // A container. Empty ones are spare storage the depot can use; anything
+      // with contents stays where the player put it. Note this deposits the bag
+      // whole -- we never move its contents out first, so nothing inside can be
+      // separated from it by accident.
+      if (isContainer(it) && it.contents.every((s) => s == null)) return { item: it };
+      continue;
+    }
     if (!KEEP_ITEMS.has(it.itemId)) return { item: it };
     // A kept consumable: bank only the amount above the reserve, and only when
     // this single stack is what pushes us over -- partial deposits use the
@@ -168,6 +193,117 @@ export function nextDeposit(bot, keepQty = KEEP_QUANTITY) {
     if (qty > 0) return { item: it, quantity: qty };
   }
   return null;
+}
+
+// ---- where in the depot it goes -------------------------------------------
+
+// Containers we refuse to fill even when they turn up in the depot. A corpse in
+// the bank is a curiosity rather than storage, and stuffing the haul into one is
+// the kind of thing that is very funny until the corpse despawns with the haul
+// inside it.
+const CLOSED_CONTAINERS = new Set(['corpse', 'playerBody']);
+
+/**
+ * True if `it` is a container we may store things inside.
+ *
+ * The test is `contents != null`, the same one `backpack()` and `nextDeposit`
+ * use -- the server marks every container that way, and a bag with all its slots
+ * full still has the array. Deliberately NOT a check against a list of backpack
+ * itemIds: a corpse is a container too, and so is anything the game adds later.
+ * What we must not do is descend into something whose contents are somebody
+ * else's problem, which is why `CLOSED_CONTAINERS` exists.
+ */
+function isContainer(it) {
+  return !!it && it.contents != null && !CLOSED_CONTAINERS.has(it.itemId);
+}
+
+// How deep to recurse when looking for a free slot. Dario's depot is a depth-2
+// chain, so 2 would already cover the observed case; the limit exists to bound
+// the walk over a structure the SERVER owns, not to express a game rule -- if a
+// depotUpdate ever came back with a container cycle, an unbounded search would
+// hang the tick. Generous enough that real nesting is never the thing that stops
+// us.
+const MAX_NEST_DEPTH = 8;
+
+/**
+ * The container inside the depot with a free slot, nearest to the top.
+ *
+ * Breadth-first, and that ordering is the whole policy: filling the box's own
+ * slots before descending keeps the shallowest arrangement that holds the haul,
+ * which is the one a human can still read when they open the box. A depth-first
+ * search would bury the first dagger of the run at the bottom of the deepest
+ * chain and leave the top level empty.
+ *
+ * Returns the depot itself when it has room -- so the common case (a box that is
+ * not full) behaves exactly as it did before nesting existed.
+ */
+export function depotSlot(depot, maxDepth = MAX_NEST_DEPTH) {
+  if (!depot || depot.contents == null) return null;
+  // [container, depth]. Seeded with the box itself: its own slots come first.
+  let level = [depot];
+  // `seen` guards against a container graph that is not a tree. The server has
+  // never sent one, but this walk is over data we do not control and a cycle
+  // would spin the tick rather than fail loudly.
+  const seen = new Set([depot.instanceId]);
+  for (let depth = 0; depth <= maxDepth && level.length; depth++) {
+    const next = [];
+    for (const c of level) {
+      const contents = c.contents || [];
+      // A free slot at this level wins -- BFS means no shallower one exists.
+      if (contents.some((s) => s == null)) return c;
+      for (const it of contents) {
+        if (!isContainer(it) || seen.has(it.instanceId)) continue;
+        seen.add(it.instanceId);
+        next.push(it);
+      }
+    }
+    level = next;
+  }
+  return null;
+}
+
+/**
+ * A name for a nested bag that a human can act on.
+ *
+ * "keeping track of which backpack is which" is the actual difficulty with a
+ * nested depot: every bag reports the same `itemId`, so a log line saying
+ * "into the backpack" names three different containers over one trip. The
+ * instanceId is what distinguishes them and what the server addresses, so it
+ * goes in the line -- shortened, because the full one is a UUID and the log is
+ * read in a narrow panel.
+ */
+function it2Name(it) {
+  const id = String(it.instanceId ?? '?');
+  return `${it.itemId ?? 'container'}(${id.length > 8 ? `${id.slice(0, 8)}…` : id})`;
+}
+
+/**
+ * How many free slots the depot holds in total, counting nested bags.
+ *
+ * Only used for the log line -- "depot open (12/40 slots used)" is a lie once
+ * the box holds bags, and the number a human wants when deciding whether to buy
+ * another backpack is the one that counts the nesting.
+ */
+export function depotFree(depot, maxDepth = MAX_NEST_DEPTH) {
+  if (!depot || depot.contents == null) return [0, 0];
+  let free = 0; let cap = 0;
+  let level = [depot];
+  const seen = new Set([depot.instanceId]);
+  for (let depth = 0; depth <= maxDepth && level.length; depth++) {
+    const next = [];
+    for (const c of level) {
+      const contents = c.contents || [];
+      cap += contents.length;
+      for (const it of contents) {
+        if (it == null) { free++; continue; }
+        if (!isContainer(it) || seen.has(it.instanceId)) continue;
+        seen.add(it.instanceId);
+        next.push(it);
+      }
+    }
+    level = next;
+  }
+  return [free, cap];
 }
 
 // ---- the trip -------------------------------------------------------------
@@ -251,8 +387,12 @@ export function handleDepot(bot, msg, log) {
   const depot = msg.depot || null;
   bot.depot = depot;
   if (depot) {
-    const used = (depot.contents || []).filter(Boolean).length;
-    const cap = (depot.contents || []).length;
+    // Counted over the nesting, not just the box's own slots: once the box holds
+    // bags, its top-level count says "full" while there is plenty of room
+    // inside, and that is the number a human uses to decide whether to buy
+    // another backpack.
+    const [free, cap] = depotFree(depot);
+    const used = cap - free;
     // Log the OPENING, not every update. The server re-sends depotUpdate after
     // each successful deposit (and keeps sending them for a while afterwards),
     // so logging unconditionally printed "depot open" once per deposited item
@@ -375,6 +515,22 @@ export function bankStep(bot, snap, me, cfg, log) {
     return false;
   }
 
+  // Where it goes: the box's own slots first, then into a bag stored in the box,
+  // then a bag in that bag. Resolved per deposit rather than once per trip
+  // because each successful moveItem fills a slot -- caching the destination
+  // would keep aiming at a container that filled up two items ago.
+  const into = depotSlot(depot);
+  if (!into) {
+    // Every slot at every depth is occupied. Nothing to do but leave: staying
+    // would re-offer the same item until the trip timed out, which is the
+    // deposit-side twin of the corpse loot loop.
+    const [dFree, dCap] = depotFree(depot);
+    log?.(`!! the depot is full (${dCap - dFree}/${dCap} slots, nested included)`
+      + ' -- store a spare backpack in it to make room');
+    endBanking(bot, log);
+    return false;
+  }
+
   if (depotSince(bot, 'bankLastMove') >= DEPOSIT_INTERVAL_S) {
     bot.run.bankLastMove = t;
     const { item: it, quantity } = next;
@@ -390,9 +546,11 @@ export function bankStep(bot, snap, me, cfg, log) {
       log?.(`giving up on ${it.itemId} -- the depot will not take it`);
       return true;
     }
-    log?.(`depositing ${it.itemId} x${quantity ?? it.quantity ?? 1}`);
+    const where = into.instanceId === depot.instanceId
+      ? '' : ` into the ${it2Name(into)}`;
+    log?.(`depositing ${it.itemId} x${quantity ?? it.quantity ?? 1}${where}`);
     bot.moveItem(it.instanceId,
-      { kind: 'container', containerInstanceId: depot.instanceId }, quantity);
+      { kind: 'container', containerInstanceId: into.instanceId }, quantity);
   }
   const [free, cap] = bot.packSpace();
   farmLog(bot, 'BANK', () => `stowing (${cap - free}/${cap} slots used)`, log);
