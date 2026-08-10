@@ -45,6 +45,8 @@ up new releases on its own check. Nothing is sent until you press Start.
 | retreat below % | `--retreat-hp` | fall back to the healer under this |
 | resume above % | `--resume-hp` | resume fighting only above this |
 | loot drops | `--loot` | sweep corpses and loose drops |
+| keep | `--keep` | item types this run is *for*: looted first, never discarded |
+| drop junk when full | `--no-make-room` to disable | shed worthless gear and keep farming instead of banking |
 | eat when hungry | `--no-eat` to disable | eat to hold `wellFed`, which is what regenerates HP |
 | cook raw meat | `--no-cook` to disable | raw meat is worth far more cooked |
 | merge stacks | `--no-stack` to disable | pour split stacks together to free pack slots |
@@ -131,6 +133,53 @@ depth 2 — so a full-looking box is rarely actually full, and the haul stays as
 shallow as it can rather than being buried at the bottom of the deepest chain.
 Empty spare bags in the pack get stowed (that is what grows the depot); a bag
 with anything in it is left alone. Corpses are never filled.
+
+### Loot priority, and farming through a full pack
+
+A full pack used to mean exactly one thing: walk to the depot. That is the right
+answer when the bag is full of haul and an expensive one when it is full of rags
+— the round trip is the better part of a minute of not farming, and the bot spent
+it to bank an 8oz shabby shirt.
+
+So a full pack now asks a question first: **is there anything in here I would
+rather have thrown away than walked home with?** If yes, it drops the worst of it
+and carries on. The trip is deferred until the pack is genuinely full of things
+worth keeping, which is when it was always worth making.
+
+**`--keep shortsword,rubyNecklace`** names what the run is *for*. Those types are
+picked up ahead of anything else — worth walking twice `lootPx` for, where
+ordinary haul is not — and are never the thing thrown away. With nothing named
+the bot behaves as it always did.
+
+What counts as junk is read from the client, not guessed:
+
+- **Weights** come from the bundle's own table (`plateArmor` 72oz, `crowbar` 30,
+  `apple` 1), so "heaviest first" is the real ordering. Weight is the limit that
+  actually binds on a haul of armour, and discarding the lightest junk first
+  would need five drops to buy what one buys.
+- **Tier** is the equip requirement — `shortsword` needs str 11, `ironSword` 13,
+  `ghostblade` 16. There is no shop and no gold value anywhere in the client, so
+  this is the game's own statement of what a thing is worth. Gear the game asks
+  *nothing* to wear is starting kit, and that is the junk.
+
+Two rules keep that from going wrong, and both were wrong first:
+
+- **Only equipment is judged this way.** "No stat requirement" reads as "low
+  tier" for gear and as nonsense for everything else — it is equally true of
+  `emberOre`, `ratKingsCrown` and `gold`. A first version threw ore on the floor;
+  the fix is to ask the *equip-slot* table first and leave anything with no slot
+  alone.
+- **The requirement table is not the bonus table.** Both begin `dagger:{dex:N}`
+  in the bundle, and reading the wrong one inverts everything: plate armour
+  *grants* str 2 and *requires* str 16, so a bot reading bonuses ranks plate
+  below a shortsword and banks the shortsword.
+
+A **full depot** is now a reason to keep farming rather than a spin. Measured
+live: with the box genuinely full, the trip ended, `shouldBank` was still true on
+the next tick, and the bot re-latched — walk, open, "it's full", leave — about
+ten times a second, farming nothing. The verdict now stands for two minutes
+before the box is worth another look, and shedding junk is what keeps the bot
+productive in the meantime.
 
 ### Going where the monster actually is
 

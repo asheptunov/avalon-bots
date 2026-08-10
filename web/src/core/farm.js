@@ -12,7 +12,10 @@ import * as nav from './nav.js';
 // whichever module the loader starts with, the other's bindings are live by the
 // time any of this runs. Keeping the bank logic in its own file is worth it --
 // it is the one behaviour with a table of world coordinates in it.
-import { shouldBank, bankStep, endBanking, DEPOT_Z } from './depot.js';
+import {
+  shouldBank, bankStep, endBanking, depotFullRecently, DEPOT_Z,
+} from './depot.js';
+import { weightOz, itemTier, isJunk, junkRank } from './items.js';
 
 const now = () => performance.now() / 1000;
 
@@ -400,6 +403,12 @@ const COOKABLE = ['rawMeat'];
 const LOOT_REACH_PX = TILE * 1.2;
 const LOOT_TIMEOUT_S = 6.0;
 
+// How much further than `lootPx` a `--keep` item is worth walking. 2x, i.e. 16
+// tiles at the default: far enough that the thing the run is FOR is never left
+// on the floor for being a few tiles out, close enough that it stays a detour
+// within the farming ground rather than a march across the map.
+const KEEP_LOOT_REACH_MULT = 2;
+
 // A killed monster leaves a `corpse` whose *contents* are the actual drops. The
 // container itself weighs 0 and equips nowhere -- taking it does nothing.
 const LOOT_CONTAINERS = new Set(['corpse', 'playerBody']);
@@ -435,22 +444,50 @@ export function* lootCandidates(bot, snap) {
 }
 
 /**
- * The nearest takeable [groundEntry, item], with the distance we already
- * computed, or null.
+ * How much we want `itemId`, as a band. Higher is picked up first.
+ *
+ * Three bands rather than a continuous score, because the ordering that matters
+ * is coarse and the tiebreak inside each band should stay DISTANCE. A finer
+ * score would have the bot cross a room for a marginally better sword and walk
+ * past the one at its feet, which is slower farming for no gain.
+ *
+ *   2  a `--keep` type -- the whole point of the flag: what this run is for
+ *   1  ordinary haul
+ *   0  junk we would throw away to make room for band 1 (see isJunk)
+ *
+ * Junk is still band 0 rather than skipped outright: with an empty pack there is
+ * no reason to leave a 30oz mace on the floor, and `makeRoomStep` will be the
+ * one to reconsider it when the pack fills.
+ */
+export function lootPriority(itemId, cfg) {
+  if (cfg?.keepItems?.length && cfg.keepItems.includes(itemId)) return 2;
+  return isJunk(itemId, cfg?.junkMinOz) ? 0 : 1;
+}
+
+/**
+ * The best takeable [groundEntry, item], with the distance we already computed,
+ * or null.
+ *
+ * PRIORITY first, distance second. The priority half is what issue #9 asked
+ * for: on a field where the pack fills faster than we can carry it away, which
+ * drops we take is the difference between coming home with shortswords and
+ * coming home with shabby shirts. Within a band the nearest still wins, because
+ * walking further for an equally good item is pure loss.
  *
  * The distance comes back with the result because this walks every ground entry
  * AND every corpse's contents -- on a busy field that's the tick's biggest scan,
  * and the callers all want both answers. Returning only the winner meant the
  * caller re-derived the distance and, worse, ran the whole scan a second time.
  */
-function nearestLoot(bot, snap, me, others = null) {
-  let best = null; let bestD = Infinity;
+function nearestLoot(bot, snap, me, others = null, cfg = null) {
+  let best = null; let bestD = Infinity; let bestP = -Infinity;
   for (const c of lootCandidates(bot, snap)) {
     if (others && others.length && lootIsContested(c[0], others)) continue;
+    const p = cfg ? lootPriority(c[1].itemId, cfg) : 1;
     const d = distPx(c[0].x, c[0].y, me.x, me.y);
-    if (d < bestD) { bestD = d; best = c; }
+    if (p > bestP || (p === bestP && d < bestD)) { bestP = p; bestD = d; best = c; }
   }
-  return best && { where: best[0], item: best[1], dist: bestD };
+  return best && { where: best[0], item: best[1], dist: bestD, priority: bestP };
 }
 
 /**
@@ -536,6 +573,18 @@ export class FarmConfig {
     // Include nightOnly spawns (wraiths) when choosing a spot. They are not
     // there in daylight, so a wraith hunt is an empty room until you ask.
     this.night = o.night ?? false;
+    // Item types this run is FOR, e.g. ['shortsword', 'rubyNecklace']. They are
+    // picked up ahead of anything else (see lootPriority), never thrown away to
+    // make room, and never banked away by mistake. Empty means "everything is
+    // equally interesting", which is the old behaviour exactly.
+    this.keepItems = o.keepItems ?? [];
+    // Throw junk on the ground to keep farming, instead of walking to the depot
+    // the moment the pack fills. On by default -- see makeRoomStep for why the
+    // trip is the expensive option and this is nearly free.
+    this.makeRoom = o.makeRoom ?? true;
+    // Don't bother discarding anything lighter than this: a 3oz drop does not
+    // move a 250oz limit, and each one costs a moveItem and a tick.
+    this.junkMinOz = o.junkMinOz ?? 8;
     // Bank at the depot when the pack fills, instead of leaving drops behind.
     this.bank = o.bank ?? true;
     // Leave for the bank with this many slots still free -- see shouldBank.
@@ -700,6 +749,86 @@ function lootStep(bot, snap, me, log, found = undefined) {
     bot.run.farmPendingLoot = { instanceId: it.instanceId, itemId: it.itemId };
     bot.takeItem(it);
   }
+  return true;
+}
+
+/**
+ * The worst thing in the pack that we would throw away, or null.
+ *
+ * Walks the backpack's own slots rather than `iterItems()` for the same reason
+ * `nextDeposit` does: `iterItems` recurses into equipment, and discarding the
+ * armour we are wearing to make room for a shabby shirt would be a memorable
+ * bug. Nested bags are skipped whole -- a bag is storage, and its contents are
+ * not ours to scatter on the floor one item at a time.
+ */
+export function worstJunk(bot, cfg) {
+  const pack = bot.backpack();
+  if (!pack) return null;
+  const keep = cfg?.keepItems || [];
+  let best = null; let bestKey = null;
+  for (const it of pack.contents || []) {
+    if (!it || it.contents != null) continue;
+    if (keep.includes(it.itemId)) continue;      // this run is FOR these
+    if (!isJunk(it.itemId, cfg?.junkMinOz)) continue;
+    const key = junkRank(it.itemId);
+    if (!best || key[0] < bestKey[0]
+        || (key[0] === bestKey[0] && key[1] < bestKey[1])) {
+      best = it; bestKey = key;
+    }
+  }
+  return best;
+}
+
+// One drop per this many seconds, matching the loot and deposit cadence: the
+// server applies inventory moves one at a time and a burst just races its own
+// updates.
+const DISCARD_INTERVAL_S = 0.4;
+
+/**
+ * Throw the worst junk on the ground to keep farming. True if we sent a drop.
+ *
+ * This is what issue #9 called "keep farming until it becomes unproductive".
+ * Before it, a full pack meant exactly one thing: walk to the depot. That is the
+ * right answer when the bag is full of haul and an expensive one when it is full
+ * of rags -- a cross-town round trip is the better part of a minute of not
+ * farming, and the bot would spend it to bank 8oz of shabby shirt.
+ *
+ * So a full pack now asks a question first: is there anything in here I would
+ * rather have thrown away than walked home with? If yes, drop it and carry on;
+ * the trip is deferred until the pack is genuinely full of things worth keeping,
+ * which is when it was always worth making.
+ *
+ * The drop goes to OUR OWN TILE, not the item's original position -- the server
+ * takes `{kind:'ground', x, y}` and the tile under us is the only one we know is
+ * both walkable and in reach. It despawns on its own; nothing needs cleaning up.
+ *
+ * Deliberately NOT gated on `cfg.bank`. A run with banking off still fills its
+ * pack, and "leaving loot on the ground" is what it did about it -- being able
+ * to choose WHICH loot is strictly better, and it is the only pack management
+ * such a run has.
+ */
+function makeRoomStep(bot, me, cfg, log) {
+  if (!cfg.makeRoom) return false;
+  const [free, cap] = bot.packSpace();
+  if (!cap) return false;
+  // Only when a limit is actually binding. Discarding early would throw away
+  // sellable gear to protect headroom we are not using -- the junk is worth
+  // more in the bag than on the floor right up until the moment it costs us a
+  // slot we need.
+  const tight = free <= (cfg.bankFreeSlots ?? 1) || bot.overloaded(cfg.junkMinOz ?? 8);
+  if (!tight) return false;
+
+  const junk = worstJunk(bot, cfg);
+  if (!junk) return false;                       // nothing to give: bank instead
+
+  if (since(bot, 'farmLastDrop') < DISCARD_INTERVAL_S) return true;
+  bot.run.farmLastDrop = now();
+  const [carried, capOz] = bot.weight();
+  log?.(`dropping ${junk.itemId} (${weightOz(junk.itemId)}oz, tier `
+    + `${itemTier(junk.itemId)}) to keep farming -- `
+    + `${cap - free}/${cap} slots, ${Math.round(carried)}/${Math.round(capOz)}oz`);
+  bot.moveItem(junk.instanceId,
+    { kind: 'ground', x: Math.round(me.x), y: Math.round(me.y) });
   return true;
 }
 
@@ -1379,7 +1508,23 @@ export function makeFarm(cfg, log) {
     // the pack is still full -- and the log fills with one abandoned bank run per
     // 100 ms. Cleared by climbStep succeeding for any other reason, since a bot
     // that has changed floors deserves a fresh look.
-    if (!bot.run.banking && !bot.run.bankStranded && shouldBank(bot, cfg)) {
+
+    // Make room by throwing junk away BEFORE deciding to bank. The order is the
+    // point: a pack that is full of rags is not a reason to stop farming, and
+    // asking this first is what turns "full" from a trip into a drop. Once
+    // there is no junk left the question falls through to shouldBank unchanged,
+    // so a bag full of actual haul still goes to the depot as it always did.
+    //
+    // Skipped once the trip has latched: a bot walking to the bank has no use
+    // for slots and should arrive with everything it has. The one exception is
+    // `bankFull` below -- a depot that cannot take the haul makes shedding junk
+    // the only way left to keep farming, so that flag clears the latch first.
+    if (!bot.run.banking && makeRoomStep(bot, me, cfg, log)) {
+      farmLog(bot, 'KEEP', () => 'making room', log);
+      return;
+    }
+    if (!bot.run.banking && !bot.run.bankStranded && !depotFullRecently(bot)
+        && shouldBank(bot, cfg)) {
       bot.run.banking = true;
       // Retarget the floor on the tick that latches, not just from the next one
       // onwards: the override at the top of the tick reads `banking`, which was
@@ -1487,8 +1632,14 @@ export function makeFarm(cfg, log) {
     const engaged = !!attacker
       || (m && distPx(m.x, m.y, me.x, me.y) < MELEE_RANGE_PX);
     // One ground scan for the whole tick, reused by both loot branches below.
-    const loot = cfg.loot ? nearestLoot(bot, snap, me, others) : null;
-    if (loot && !engaged && loot.dist <= cfg.lootPx) {
+    const loot = cfg.loot ? nearestLoot(bot, snap, me, others, cfg) : null;
+    // A `--keep` type is worth walking further for than ordinary haul: `lootPx`
+    // is tuned so the bot doesn't abandon a field to chase a rat's leavings, and
+    // that reasoning does not apply to the item the run exists to collect. Not
+    // unbounded, though -- the far edge of the screen is still a detour, and the
+    // spawn we walked to is the thing we came for.
+    const reach = loot?.priority >= 2 ? cfg.lootPx * KEEP_LOOT_REACH_MULT : cfg.lootPx;
+    if (loot && !engaged && loot.dist <= reach) {
       if (lootStep(bot, snap, me, log, loot)) {
         farmLog(bot, 'LOOT', null, log);
         return;

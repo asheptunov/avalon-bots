@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Avalon Farm Bot
 // @namespace    https://github.com/asheptunov/avalon-bots
-// @version      0.11.3
+// @version      0.12.0
 // @description  Drives your on-screen Avalon character: kill / loot / cook / eat / heal.
 // @author       asheptunov
 // @match        https://avalon.juanandresleon.com/*
@@ -203,6 +203,324 @@ function decodeCombatEvent(buf) {
   ev.blocked = !!(f & 4);
   ev.frost = !!(f & 8);
   return ev;
+}
+
+// ===== core/items.js =============================================
+// Item facts, extracted from the game client: what a thing WEIGHS and how good
+// it is. Both are things the server never tells us and the farm loop has to
+// know, because "the pack is full" is a question about weight and "which of
+// these do I throw away" is a question about worth.
+//
+// Until this existed the bot's only answer to a full pack was to walk to the
+// depot. That is the right move when the pack is full of things worth keeping
+// and the wrong one when it is full of shabby shirts: a cross-town round trip to
+// bank 8oz of rags is most of a minute of not farming, and the bot did it over
+// and over. Knowing what each item weighs and roughly what tier it is turns that
+// into a decision -- drop the rags, keep killing, and save the trip for a haul
+// that deserves one.
+//
+// Everything here is READ FROM THE BUNDLE, matched by structure and never by
+// minified name, for the same reason maps.js is: the minifier renames every
+// symbol on each deploy (`iy`, `_y` and `Ty` today are three other names next
+// week), so a name-matched table breaks silently the first time the game ships.
+// A structural anchor -- "the object literal whose first key is `dagger` and
+// whose values are numbers" -- survives renaming, and there is exactly one of
+// each in the bundle.
+//
+// The BAKED tables below are the fallback, generated from the live bundle at
+// the time of writing, exactly like `maps.json`. Extraction is preferred at
+// runtime; the baked copy is what keeps the bot working on the tick where the
+// extraction regex meets a bundle it does not recognise. It fails loudly (a log
+// line) rather than silently, because a stale weight table makes drop decisions
+// that look arbitrary rather than broken.
+
+// ---- baked fallbacks ------------------------------------------------------
+
+/** Item weight in ounces, from the client's own table. */
+const ITEM_WEIGHT_OZ = {
+  dagger: 8, gold: 0.1, crowbar: 30, woodenBow: 22, wraithbow: 20,
+  zealotStaff: 30, iceStaff: 24, quiver: 0, shabbyShirt: 8, pocketWatch: 3,
+  shortsword: 25, mace: 30, ironSword: 40, shield: 30, helmet: 15,
+  leatherArmor: 30, chainmail: 55, leatherLegs: 20, leatherBoots: 14,
+  rubyNecklace: 2, silverRing: 1, peridotRing: 1, novasRing: 1,
+  quickstepBand: 1, crescentPendant: 2, cleaver: 30, cutlass: 22,
+  thiefPants: 12, thiefHood: 6, thiefVest: 14, thiefBoots: 8, plateShield: 38,
+  ratKingsCrown: 8, cheese: 2, apple: 1, fish: 2, iceCream: 2,
+  smithingHammer: 22, emberOre: 12, tchallaClaws: 18, shuriPawboots: 12,
+  avocado: 1, rawMeat: 3, cookedMeat: 2, healthPotion: 1,
+  largeHealthPotion: 2, manaPotion: 1, largeManaPotion: 2, studdedArmor: 42,
+  plateArmor: 72, steelHelmet: 22, ironShield: 34, iceShield: 40,
+  plateLegs: 28, plateBoots: 24, spikeshellHelm: 30, magicianHat: 6,
+  magicianRobe: 16, magicianPants: 9, magicianBoots: 4, ghostblade: 35,
+  scaleArmor: 40, warspear: 32, ashscaleMace: 45, hellbow: 22,
+  gildedAegis: 50, rubyStaff: 28, garnetNecklace: 2, jadeNecklace: 2,
+  sapphireNecklace: 2, onyxNecklace: 2, torch: 12, backpack: 5,
+  largeBackpack: 7, adventurersBackpack: 4, corpse: 0, playerBody: 0, depot: 0,
+};
+
+/**
+ * The stat an item demands to equip it, e.g. `{str: 13}`.
+ *
+ * This is the closest thing the client has to a PRICE. There is no shop and no
+ * gold value anywhere in the bundle, so "how good is this" has to be inferred,
+ * and the requirement is the game's own statement of it: `shortsword` needs
+ * str 11, `ironSword` str 13, `ghostblade` str 16, and that ordering is exactly
+ * the ordering a player would give those three swords. Gear with no requirement
+ * at all (`shabbyShirt`, `helmet`) is starting kit -- the junk this is for.
+ */
+const ITEM_REQS = {
+  dagger: { dex: 11 }, shortsword: { str: 11 }, mace: { str: 12 },
+  ironSword: { str: 13 }, ghostblade: { str: 16 }, woodenBow: { dex: 12 },
+  wraithbow: { dex: 15 }, tchallaClaws: { dex: 16 }, zealotStaff: { int: 15 },
+  iceStaff: { int: 12 }, chainmail: { str: 12 }, plateArmor: { str: 16 },
+  plateLegs: { str: 14 }, plateBoots: { str: 13 }, spikeshellHelm: { str: 13 },
+  magicianHat: { int: 12 }, magicianRobe: { int: 14 },
+  magicianPants: { int: 12 }, magicianBoots: { int: 11 },
+  steelHelmet: { str: 12 }, ironShield: { str: 10 }, plateShield: { str: 12 },
+  iceShield: { str: 13 }, studdedArmor: { dex: 12 }, scaleArmor: { dex: 14 },
+  warspear: { str: 12, dex: 14 }, ashscaleMace: { str: 15 },
+  hellbow: { dex: 17 }, gildedAegis: { str: 15 }, rubyStaff: { int: 18 },
+};
+
+/**
+ * Which equipment slot an item goes in, or null for anything you cannot wear.
+ *
+ * This is what makes the tier test safe to apply. "No equip requirement" is a
+ * good proxy for "low-tier gear" and a terrible one for everything else: it is
+ * equally true of `emberOre`, which is crafting material worth carrying home,
+ * and of `ratKingsCrown`, which is a trophy. Both would have been thrown on the
+ * floor by a rule that only read the requirement table.
+ *
+ * So the junk test asks this table FIRST -- only a wearable thing is eligible
+ * to be judged by what it takes to wear it. A `null` slot means the item's worth
+ * is expressed some other way, and we leave it alone.
+ */
+const ITEM_SLOT = {
+  dagger: 'hand', gold: null, crowbar: 'hand', woodenBow: 'hand',
+  wraithbow: 'hand', zealotStaff: 'hand', iceStaff: 'hand', quiver: 'hand',
+  shabbyShirt: 'chest', pocketWatch: 'accessory', shortsword: 'hand',
+  mace: 'hand', ironSword: 'hand', shield: 'hand', helmet: 'head',
+  leatherArmor: 'chest', chainmail: 'chest', leatherLegs: 'legs',
+  leatherBoots: 'feet', rubyNecklace: 'necklace', silverRing: 'ring',
+  peridotRing: 'ring', novasRing: 'ring', quickstepBand: 'ring',
+  crescentPendant: 'necklace', cleaver: 'hand', cutlass: 'hand',
+  thiefPants: 'legs', thiefHood: 'head', thiefVest: 'chest',
+  thiefBoots: 'feet', plateShield: 'hand', ratKingsCrown: null, cheese: null,
+  apple: null, fish: null, iceCream: null, emberOre: null,
+  smithingHammer: 'hand', tchallaClaws: 'hand', shuriPawboots: 'feet',
+  avocado: null, rawMeat: null, cookedMeat: null, healthPotion: null,
+  largeHealthPotion: null, manaPotion: null, largeManaPotion: null,
+  studdedArmor: 'chest', plateArmor: 'chest', steelHelmet: 'head',
+  ironShield: 'hand', iceShield: 'hand', plateLegs: 'legs',
+  plateBoots: 'feet', spikeshellHelm: 'head', magicianHat: 'head',
+  magicianRobe: 'chest', magicianPants: 'legs', magicianBoots: 'feet',
+  ghostblade: 'hand', scaleArmor: 'chest', warspear: 'hand',
+  ashscaleMace: 'hand', hellbow: 'hand', gildedAegis: 'hand',
+  rubyStaff: 'hand', garnetNecklace: 'necklace', jadeNecklace: 'necklace',
+  sapphireNecklace: 'necklace', onyxNecklace: 'necklace', torch: 'hand',
+  backpack: 'backpack', largeBackpack: 'backpack',
+  adventurersBackpack: 'backpack', corpse: null, playerBody: null, depot: null,
+};
+
+// Live tables, swapped in by `loadItems`. Kept as module state (rather than
+// threaded through every call) to match how nav.js holds the collision maps:
+// the callers are deep in the farm loop and there is exactly one game.
+let weights = ITEM_WEIGHT_OZ;
+let reqs = ITEM_REQS;
+let slots = ITEM_SLOT;
+
+// ---- extraction -----------------------------------------------------------
+
+/**
+ * Parse one flat `{key:number, ...}` object literal at `at`.
+ *
+ * Hand-rolled rather than `JSON.parse` because these are minified JS literals,
+ * not JSON: keys are bare and numbers come through as `.1` rather than `0.1`.
+ */
+function parseNumberTable(js, at) {
+  const end = js.indexOf('}', at);
+  if (end < 0) return null;
+  const out = {};
+  for (const m of js.slice(at, end).matchAll(/([A-Za-z_$][\w$]*):(-?\d*\.?\d+)/g)) {
+    out[m[1]] = Number(m[2]);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * The item weight table, or null when the bundle no longer contains one we
+ * recognise.
+ *
+ * Anchored on `dagger:` followed by a bare number and then more `key:number`
+ * pairs -- the weight table is the only flat number map in the bundle that
+ * starts at `dagger`, and `gold:.1` right after it is a fingerprint no other
+ * table shares. Deliberately NOT anchored on `iy=`, which is this week's name.
+ */
+function extractWeights(js) {
+  const m = /\{dagger:\d+(?:\.\d+)?,gold:\.?\d/.exec(js);
+  return m ? parseNumberTable(js, m.index) : null;
+}
+
+/**
+ * The equip-requirement table, or null.
+ *
+ * TWO tables in the bundle open with `dagger:{dex:N}` and telling them apart is
+ * the whole difficulty here. The other one is the stat BONUS an item grants
+ * (`dagger:{dex:2}`, `shortsword:{str:1}`) -- same shape, same first key,
+ * completely different meaning, and reading it as the requirement inverts the
+ * ranking: `shortsword` and `plateArmor` both score 1-2 there, so the tier test
+ * would call plate armour junk.
+ *
+ * The anchor is therefore the SECOND key. Requirements are indexed by weapon
+ * (`dagger`, then `shortsword`); bonuses run through accessories
+ * (`crescentPendant` next). Requirement values are also all >= 10, where bonuses
+ * are single digits -- asserted here as a second condition so a bundle that
+ * reorders the keys fails to match rather than matching the wrong table.
+ */
+function extractReqs(js) {
+  const m = /\{dagger:\{(?:str|dex|int):\d\d+\},shortsword:\{(?:str|dex|int):\d\d+\}/
+    .exec(js);
+  if (!m) return null;
+  // Bounded by the first `}}`: the table is one nesting level deep throughout.
+  const end = js.indexOf('}}', m.index);
+  if (end < 0) return null;
+  const out = {};
+  const re = /([A-Za-z_$][\w$]*):\{([^}]*)\}/g;
+  for (const e of js.slice(m.index, end + 2).matchAll(re)) {
+    const stats = {};
+    for (const s of e[2].matchAll(/([A-Za-z_$][\w$]*):(\d+)/g)) stats[s[1]] = +s[2];
+    if (Object.keys(stats).length) out[e[1]] = stats;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * The equip-slot table, or null.
+ *
+ * Anchored on `dagger:"hand",gold:null` -- the null is the fingerprint. Several
+ * tables in the bundle map itemIds to strings (display names, sprite paths,
+ * weapon classes); this is the only one whose values include `null`, because it
+ * is the only one that has to say "this is not equipment at all".
+ */
+function extractSlots(js) {
+  const m = /\{dagger:"[a-z]+",gold:null/.exec(js);
+  if (!m) return null;
+  const end = js.indexOf('}', m.index);
+  if (end < 0) return null;
+  const out = {};
+  const re = /([A-Za-z_$][\w$]*):(?:"([a-z]+)"|null)/g;
+  for (const e of js.slice(m.index, end).matchAll(re)) out[e[1]] = e[2] ?? null;
+  return Object.keys(out).length ? out : null;
+}
+
+/**
+ * Install tables extracted from a live bundle, falling back to the baked ones
+ * per table.
+ *
+ * Returns what actually happened so the caller can log it -- a silent fallback
+ * to a stale weight table is how "why did it throw away my sword" starts.
+ */
+function loadItems(js) {
+  const w = js ? extractWeights(js) : null;
+  const r = js ? extractReqs(js) : null;
+  const s = js ? extractSlots(js) : null;
+  weights = w || ITEM_WEIGHT_OZ;
+  reqs = r || ITEM_REQS;
+  slots = s || ITEM_SLOT;
+  return { weights: !!w, reqs: !!r, slots: !!s };
+}
+
+/** Reset to the baked tables. Exists for tests. */
+function resetItems() {
+  weights = ITEM_WEIGHT_OZ;
+  reqs = ITEM_REQS;
+  slots = ITEM_SLOT;
+}
+
+/** The equipment slot `itemId` goes in, or null if it is not equipment. */
+function equipSlot(itemId) {
+  return slots[itemId] ?? null;
+}
+
+// ---- what the farm loop asks ----------------------------------------------
+
+/**
+ * What one unit of `itemId` weighs, in ounces.
+ *
+ * Unknown items weigh 0, NOT some guessed average. An item the table has never
+ * heard of is one the game just added, and pretending it is heavy would have us
+ * throwing away the new thing precisely because it is new.
+ */
+function weightOz(itemId, quantity = 1) {
+  return (weights[itemId] ?? 0) * (quantity || 1);
+}
+
+/**
+ * How good `itemId` is, as a single number. Higher is better.
+ *
+ * The highest stat requirement, because that is the game's own ranking and it
+ * needs no table of ours to maintain. Requirement-less gear scores 0, which is
+ * what puts starting kit at the bottom of the drop order without naming any of
+ * it.
+ */
+function itemTier(itemId) {
+  const r = reqs[itemId];
+  if (!r) return 0;
+  let best = 0;
+  for (const v of Object.values(r)) if (v > best) best = v;
+  return best;
+}
+
+// Equipment that is never junk despite having no stat requirement, because its
+// worth is not the wearing of it.
+//
+// A `backpack` is the storage the depot trip depends on -- depot.js goes out of
+// its way to stow empty ones, and throwing them on the floor would undo that. A
+// `torch` is the only light source underground, and the one in the pack is the
+// spare you want when the equipped one is the thing that ran out.
+const NEVER_JUNK = new Set([
+  'backpack', 'largeBackpack', 'adventurersBackpack', 'torch', 'quiver',
+]);
+
+/**
+ * True if `itemId` may be thrown on the ground to make room.
+ *
+ * Deliberately narrow, and narrow in a specific way: junk is WEARABLE gear that
+ * the game asks nothing to wear -- starting kit and the drops beneath any
+ * character who can reach a cave -- that is heavy enough to be worth the slot it
+ * frees.
+ *
+ * The equippable gate is what keeps this honest. "No stat requirement" reads as
+ * "low tier" only for equipment; applied to everything it also catches
+ * `emberOre` (crafting material), `ratKingsCrown` (a trophy) and `gold`, none of
+ * which the requirement table has any opinion about and all of which are worth
+ * carrying home. Asking `equipSlot` first means the tier test is only ever
+ * applied to the items it can actually speak to. Everything else -- non-gear,
+ * anything the game gates behind a stat, anything on NEVER_JUNK, and anything
+ * the table has never heard of -- stays in the bag and rides to the depot.
+ *
+ * `minOz` is what stops this from being a nuisance: dropping a 3oz pocket watch
+ * buys nothing against a 250oz cap and costs a slot's worth of moveItem, so the
+ * floor is set where discarding actually changes the answer.
+ */
+function isJunk(itemId, minOz = 8) {
+  if (NEVER_JUNK.has(itemId)) return false;
+  if (!(itemId in weights)) return false;        // unknown: never guess
+  if (!equipSlot(itemId)) return false;          // not gear: not ours to judge
+  if (itemTier(itemId) > 0) return false;        // the game gates it: keep it
+  return weightOz(itemId) >= minOz;
+}
+
+/**
+ * Sort key for "what do I throw away first". LOWER is discarded sooner.
+ *
+ * Tier first, weight second and inverted: among equally worthless things the
+ * heaviest goes first, because weight is the limit we are actually trying to
+ * fix. That ordering is the whole point -- discarding the lightest junk first
+ * would need five drops to buy what one plate-weight drop buys.
+ */
+function junkRank(itemId) {
+  return [itemTier(itemId), -weightOz(itemId)];
 }
 
 // ===== core/maps.js ==============================================
@@ -416,6 +734,17 @@ function extractSurface(js) {
 
 /** Assemble the full {z -> zone} map set (plus a `bundle` version stamp). */
 function extractAll(js, bundleStamp = null) {
+  // Item weights and equip requirements come out of the same bundle and go
+  // stale the same way, so they are refreshed here rather than at a call site
+  // of their own -- both runtimes already funnel through this function, and a
+  // second entry point is a second place to forget. A failure is a warning, not
+  // a throw: stale weights make the bot's drop choices merely dated, where no
+  // maps at all would walk it into a wall.
+  const got = loadItems(js);
+  if (!got.weights) console.warn('  warn: item weight table not found; using baked copy');
+  if (!got.reqs) console.warn('  warn: item requirement table not found; using baked copy');
+  if (!got.slots) console.warn('  warn: item slot table not found; using baked copy');
+
   const zones = extractUnderground(js);
   let surface = null;
   try {
@@ -1488,6 +1817,17 @@ const BANK_UNTIL_WEIGHT_FRAC = 0.8;
 // More than one because a single moveItem can be lost or race an inventory
 // update; small, because the failure mode this bounds is an infinite loop.
 const DEPOSIT_ATTEMPTS = 3;
+// How long a "the depot is full" verdict stands before we walk over and look
+// again. Long enough that the retry is not the loop it replaces (the spin it
+// fixes ran at ~10 Hz), short enough that a player who empties the box gets a
+// banking bot back within a couple of minutes rather than at the next restart.
+const DEPOT_FULL_RETRY_S = 120.0;
+
+/** True while a "depot is full" verdict is still in force. */
+function depotFullRecently(bot) {
+  const at = bot.run?.bankFull;
+  return at != null && depotNow() - at < DEPOT_FULL_RETRY_S;
+}
 
 /** The walkable tile you stand on to use `box`. */
 function standTile(box) {
@@ -2014,9 +2354,21 @@ function bankStep(bot, snap, me, cfg, log) {
     // Every slot at every depth is occupied. Nothing to do but leave: staying
     // would re-offer the same item until the trip timed out, which is the
     // deposit-side twin of the corpse loot loop.
+    //
+    // `bankFull` is what stops leaving from becoming its own loop. Ending the
+    // trip does not empty the pack, so `shouldBank` is still true on the very
+    // next tick and the bot re-latches, walks the half tile back to the box,
+    // opens it, finds it full and leaves again -- measured live at roughly ten
+    // round trips a second, farming nothing and filling the log. The flag
+    // suppresses the trigger for DEPOT_FULL_RETRY_S, which turns a full depot
+    // from a spin into a bot that carries on farming and sheds junk to do it.
     const [dFree, dCap] = depotFree(depot);
+    // Stamped rather than set to `true` so the suppression can expire: the
+    // player empties the box between runs, and a flag with no way back would
+    // mean a bot that never banks again for the rest of a multi-hour session.
+    bot.run.bankFull = depotNow();
     log?.(`!! the depot is full (${dCap - dFree}/${dCap} slots, nested included)`
-      + ' -- store a spare backpack in it to make room');
+      + ' -- store a spare backpack in it to make room; farming on');
     endBanking(bot, log);
     return false;
   }
@@ -2063,6 +2415,9 @@ function endBanking(bot, log) {
   // deserves a fresh chance on the next trip, from the right tile.
   bot.run.bankTries = null;
   bot.run.bankSkip = null;
+  // NOT cleared: `bot.run.bankFull`. It is set immediately before this is
+  // called, and clearing it here would undo the suppression on the same tick --
+  // restoring the very spin it exists to stop. It expires on its own clock.
   bot.depot = null;
 }
 
@@ -2080,6 +2435,7 @@ function endBanking(bot, log) {
 // whichever module the loader starts with, the other's bindings are live by the
 // time any of this runs. Keeping the bank logic in its own file is worth it --
 // it is the one behaviour with a table of world coordinates in it.
+
 
 const now = () => performance.now() / 1000;
 
@@ -2467,6 +2823,12 @@ const COOKABLE = ['rawMeat'];
 const LOOT_REACH_PX = TILE * 1.2;
 const LOOT_TIMEOUT_S = 6.0;
 
+// How much further than `lootPx` a `--keep` item is worth walking. 2x, i.e. 16
+// tiles at the default: far enough that the thing the run is FOR is never left
+// on the floor for being a few tiles out, close enough that it stays a detour
+// within the farming ground rather than a march across the map.
+const KEEP_LOOT_REACH_MULT = 2;
+
 // A killed monster leaves a `corpse` whose *contents* are the actual drops. The
 // container itself weighs 0 and equips nowhere -- taking it does nothing.
 const LOOT_CONTAINERS = new Set(['corpse', 'playerBody']);
@@ -2502,22 +2864,50 @@ function* lootCandidates(bot, snap) {
 }
 
 /**
- * The nearest takeable [groundEntry, item], with the distance we already
- * computed, or null.
+ * How much we want `itemId`, as a band. Higher is picked up first.
+ *
+ * Three bands rather than a continuous score, because the ordering that matters
+ * is coarse and the tiebreak inside each band should stay DISTANCE. A finer
+ * score would have the bot cross a room for a marginally better sword and walk
+ * past the one at its feet, which is slower farming for no gain.
+ *
+ *   2  a `--keep` type -- the whole point of the flag: what this run is for
+ *   1  ordinary haul
+ *   0  junk we would throw away to make room for band 1 (see isJunk)
+ *
+ * Junk is still band 0 rather than skipped outright: with an empty pack there is
+ * no reason to leave a 30oz mace on the floor, and `makeRoomStep` will be the
+ * one to reconsider it when the pack fills.
+ */
+function lootPriority(itemId, cfg) {
+  if (cfg?.keepItems?.length && cfg.keepItems.includes(itemId)) return 2;
+  return isJunk(itemId, cfg?.junkMinOz) ? 0 : 1;
+}
+
+/**
+ * The best takeable [groundEntry, item], with the distance we already computed,
+ * or null.
+ *
+ * PRIORITY first, distance second. The priority half is what issue #9 asked
+ * for: on a field where the pack fills faster than we can carry it away, which
+ * drops we take is the difference between coming home with shortswords and
+ * coming home with shabby shirts. Within a band the nearest still wins, because
+ * walking further for an equally good item is pure loss.
  *
  * The distance comes back with the result because this walks every ground entry
  * AND every corpse's contents -- on a busy field that's the tick's biggest scan,
  * and the callers all want both answers. Returning only the winner meant the
  * caller re-derived the distance and, worse, ran the whole scan a second time.
  */
-function nearestLoot(bot, snap, me, others = null) {
-  let best = null; let bestD = Infinity;
+function nearestLoot(bot, snap, me, others = null, cfg = null) {
+  let best = null; let bestD = Infinity; let bestP = -Infinity;
   for (const c of lootCandidates(bot, snap)) {
     if (others && others.length && lootIsContested(c[0], others)) continue;
+    const p = cfg ? lootPriority(c[1].itemId, cfg) : 1;
     const d = distPx(c[0].x, c[0].y, me.x, me.y);
-    if (d < bestD) { bestD = d; best = c; }
+    if (p > bestP || (p === bestP && d < bestD)) { bestP = p; bestD = d; best = c; }
   }
-  return best && { where: best[0], item: best[1], dist: bestD };
+  return best && { where: best[0], item: best[1], dist: bestD, priority: bestP };
 }
 
 /**
@@ -2603,6 +2993,18 @@ class FarmConfig {
     // Include nightOnly spawns (wraiths) when choosing a spot. They are not
     // there in daylight, so a wraith hunt is an empty room until you ask.
     this.night = o.night ?? false;
+    // Item types this run is FOR, e.g. ['shortsword', 'rubyNecklace']. They are
+    // picked up ahead of anything else (see lootPriority), never thrown away to
+    // make room, and never banked away by mistake. Empty means "everything is
+    // equally interesting", which is the old behaviour exactly.
+    this.keepItems = o.keepItems ?? [];
+    // Throw junk on the ground to keep farming, instead of walking to the depot
+    // the moment the pack fills. On by default -- see makeRoomStep for why the
+    // trip is the expensive option and this is nearly free.
+    this.makeRoom = o.makeRoom ?? true;
+    // Don't bother discarding anything lighter than this: a 3oz drop does not
+    // move a 250oz limit, and each one costs a moveItem and a tick.
+    this.junkMinOz = o.junkMinOz ?? 8;
     // Bank at the depot when the pack fills, instead of leaving drops behind.
     this.bank = o.bank ?? true;
     // Leave for the bank with this many slots still free -- see shouldBank.
@@ -2767,6 +3169,86 @@ function lootStep(bot, snap, me, log, found = undefined) {
     bot.run.farmPendingLoot = { instanceId: it.instanceId, itemId: it.itemId };
     bot.takeItem(it);
   }
+  return true;
+}
+
+/**
+ * The worst thing in the pack that we would throw away, or null.
+ *
+ * Walks the backpack's own slots rather than `iterItems()` for the same reason
+ * `nextDeposit` does: `iterItems` recurses into equipment, and discarding the
+ * armour we are wearing to make room for a shabby shirt would be a memorable
+ * bug. Nested bags are skipped whole -- a bag is storage, and its contents are
+ * not ours to scatter on the floor one item at a time.
+ */
+function worstJunk(bot, cfg) {
+  const pack = bot.backpack();
+  if (!pack) return null;
+  const keep = cfg?.keepItems || [];
+  let best = null; let bestKey = null;
+  for (const it of pack.contents || []) {
+    if (!it || it.contents != null) continue;
+    if (keep.includes(it.itemId)) continue;      // this run is FOR these
+    if (!isJunk(it.itemId, cfg?.junkMinOz)) continue;
+    const key = junkRank(it.itemId);
+    if (!best || key[0] < bestKey[0]
+        || (key[0] === bestKey[0] && key[1] < bestKey[1])) {
+      best = it; bestKey = key;
+    }
+  }
+  return best;
+}
+
+// One drop per this many seconds, matching the loot and deposit cadence: the
+// server applies inventory moves one at a time and a burst just races its own
+// updates.
+const DISCARD_INTERVAL_S = 0.4;
+
+/**
+ * Throw the worst junk on the ground to keep farming. True if we sent a drop.
+ *
+ * This is what issue #9 called "keep farming until it becomes unproductive".
+ * Before it, a full pack meant exactly one thing: walk to the depot. That is the
+ * right answer when the bag is full of haul and an expensive one when it is full
+ * of rags -- a cross-town round trip is the better part of a minute of not
+ * farming, and the bot would spend it to bank 8oz of shabby shirt.
+ *
+ * So a full pack now asks a question first: is there anything in here I would
+ * rather have thrown away than walked home with? If yes, drop it and carry on;
+ * the trip is deferred until the pack is genuinely full of things worth keeping,
+ * which is when it was always worth making.
+ *
+ * The drop goes to OUR OWN TILE, not the item's original position -- the server
+ * takes `{kind:'ground', x, y}` and the tile under us is the only one we know is
+ * both walkable and in reach. It despawns on its own; nothing needs cleaning up.
+ *
+ * Deliberately NOT gated on `cfg.bank`. A run with banking off still fills its
+ * pack, and "leaving loot on the ground" is what it did about it -- being able
+ * to choose WHICH loot is strictly better, and it is the only pack management
+ * such a run has.
+ */
+function makeRoomStep(bot, me, cfg, log) {
+  if (!cfg.makeRoom) return false;
+  const [free, cap] = bot.packSpace();
+  if (!cap) return false;
+  // Only when a limit is actually binding. Discarding early would throw away
+  // sellable gear to protect headroom we are not using -- the junk is worth
+  // more in the bag than on the floor right up until the moment it costs us a
+  // slot we need.
+  const tight = free <= (cfg.bankFreeSlots ?? 1) || bot.overloaded(cfg.junkMinOz ?? 8);
+  if (!tight) return false;
+
+  const junk = worstJunk(bot, cfg);
+  if (!junk) return false;                       // nothing to give: bank instead
+
+  if (since(bot, 'farmLastDrop') < DISCARD_INTERVAL_S) return true;
+  bot.run.farmLastDrop = now();
+  const [carried, capOz] = bot.weight();
+  log?.(`dropping ${junk.itemId} (${weightOz(junk.itemId)}oz, tier `
+    + `${itemTier(junk.itemId)}) to keep farming -- `
+    + `${cap - free}/${cap} slots, ${Math.round(carried)}/${Math.round(capOz)}oz`);
+  bot.moveItem(junk.instanceId,
+    { kind: 'ground', x: Math.round(me.x), y: Math.round(me.y) });
   return true;
 }
 
@@ -3446,7 +3928,23 @@ function makeFarm(cfg, log) {
     // the pack is still full -- and the log fills with one abandoned bank run per
     // 100 ms. Cleared by climbStep succeeding for any other reason, since a bot
     // that has changed floors deserves a fresh look.
-    if (!bot.run.banking && !bot.run.bankStranded && shouldBank(bot, cfg)) {
+
+    // Make room by throwing junk away BEFORE deciding to bank. The order is the
+    // point: a pack that is full of rags is not a reason to stop farming, and
+    // asking this first is what turns "full" from a trip into a drop. Once
+    // there is no junk left the question falls through to shouldBank unchanged,
+    // so a bag full of actual haul still goes to the depot as it always did.
+    //
+    // Skipped once the trip has latched: a bot walking to the bank has no use
+    // for slots and should arrive with everything it has. The one exception is
+    // `bankFull` below -- a depot that cannot take the haul makes shedding junk
+    // the only way left to keep farming, so that flag clears the latch first.
+    if (!bot.run.banking && makeRoomStep(bot, me, cfg, log)) {
+      farmLog(bot, 'KEEP', () => 'making room', log);
+      return;
+    }
+    if (!bot.run.banking && !bot.run.bankStranded && !depotFullRecently(bot)
+        && shouldBank(bot, cfg)) {
       bot.run.banking = true;
       // Retarget the floor on the tick that latches, not just from the next one
       // onwards: the override at the top of the tick reads `banking`, which was
@@ -3554,8 +4052,14 @@ function makeFarm(cfg, log) {
     const engaged = !!attacker
       || (m && distPx(m.x, m.y, me.x, me.y) < MELEE_RANGE_PX);
     // One ground scan for the whole tick, reused by both loot branches below.
-    const loot = cfg.loot ? nearestLoot(bot, snap, me, others) : null;
-    if (loot && !engaged && loot.dist <= cfg.lootPx) {
+    const loot = cfg.loot ? nearestLoot(bot, snap, me, others, cfg) : null;
+    // A `--keep` type is worth walking further for than ordinary haul: `lootPx`
+    // is tuned so the bot doesn't abandon a field to chase a rat's leavings, and
+    // that reasoning does not apply to the item the run exists to collect. Not
+    // unbounded, though -- the far edge of the screen is still a detour, and the
+    // spawn we walked to is the thing we came for.
+    const reach = loot?.priority >= 2 ? cfg.lootPx * KEEP_LOOT_REACH_MULT : cfg.lootPx;
+    if (loot && !engaged && loot.dist <= reach) {
       if (lootStep(bot, snap, me, log, loot)) {
         farmLog(bot, 'LOOT', null, log);
         return;
@@ -3648,7 +4152,7 @@ const CSS = `
 .body { padding: 9px 10px; display: grid; gap: 8px; }
 .row { display: flex; align-items: center; gap: 8px; }
 .row label { flex: 1; color: #a9a9b6; }
-select, input[type=number] {
+select, input[type=number], input[type=text] {
   font: inherit; color: #e6e6e6; background: #24242c;
   border: 1px solid #3a3a44; border-radius: 4px; padding: 2px 5px; width: 84px;
 }
@@ -3698,6 +4202,10 @@ function createPanel({ onStart, onStop }) {
         <input id="resume" type="number" min="0" max="100" step="5" value="85"></div>
       <div class="row"><label for="loot">loot drops</label>
         <input id="loot" type="checkbox" checked></div>
+      <div class="row"><label for="keep">keep (comma-sep)</label>
+        <input id="keep" type="text" placeholder="any" title="Item types this run is for, e.g. shortsword,rubyNecklace -- looted first and never thrown away"></div>
+      <div class="row"><label for="make-room">drop junk when full</label>
+        <input id="make-room" type="checkbox" checked></div>
       <div class="row"><label for="eat">eat when hungry</label>
         <input id="eat" type="checkbox" checked></div>
       <div class="row"><label for="cook">cook raw meat</label>
@@ -3748,6 +4256,14 @@ function createPanel({ onStart, onStop }) {
       retreatFrac: Math.max(0, Math.min(100, +$('retreat').value)) / 100,
       resumeFrac: Math.max(0, Math.min(100, +$('resume').value)) / 100,
       loot: $('loot').checked,
+      // The item types this run is FOR: picked up ahead of everything else and
+      // never thrown away to make room. Blank means "everything is equally
+      // interesting", which is how the bot behaved before this existed.
+      keepItems: $('keep').value.split(',').map((s) => s.trim()).filter(Boolean),
+      // Throw junk on the ground rather than walking to the depot the moment the
+      // pack fills. The trip is most of a minute of not farming; a drop is one
+      // tick, so this is what "keep farming until it's unproductive" means.
+      makeRoom: $('make-room').checked,
       // Three independent switches: eating keeps regen up, cooking upgrades raw
       // meat, stacking frees pack slots. They are unrelated jobs and you may
       // well want one without the others.

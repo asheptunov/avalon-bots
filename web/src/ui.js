@@ -31,7 +31,7 @@ const CSS = `
 .body { padding: 9px 10px; display: grid; gap: 8px; }
 .row { display: flex; align-items: center; gap: 8px; }
 .row label { flex: 1; color: #a9a9b6; }
-select, input[type=number] {
+select, input[type=number], input[type=text] {
   font: inherit; color: #e6e6e6; background: #24242c;
   border: 1px solid #3a3a44; border-radius: 4px; padding: 2px 5px; width: 84px;
 }
@@ -81,6 +81,10 @@ export function createPanel({ onStart, onStop }) {
         <input id="resume" type="number" min="0" max="100" step="5" value="85"></div>
       <div class="row"><label for="loot">loot drops</label>
         <input id="loot" type="checkbox" checked></div>
+      <div class="row"><label for="keep">keep (comma-sep)</label>
+        <input id="keep" type="text" placeholder="any" title="Item types this run is for, e.g. shortsword,rubyNecklace -- looted first and never thrown away"></div>
+      <div class="row"><label for="make-room">drop junk when full</label>
+        <input id="make-room" type="checkbox" checked></div>
       <div class="row"><label for="eat">eat when hungry</label>
         <input id="eat" type="checkbox" checked></div>
       <div class="row"><label for="cook">cook raw meat</label>
@@ -131,6 +135,14 @@ export function createPanel({ onStart, onStop }) {
       retreatFrac: Math.max(0, Math.min(100, +$('retreat').value)) / 100,
       resumeFrac: Math.max(0, Math.min(100, +$('resume').value)) / 100,
       loot: $('loot').checked,
+      // The item types this run is FOR: picked up ahead of everything else and
+      // never thrown away to make room. Blank means "everything is equally
+      // interesting", which is how the bot behaved before this existed.
+      keepItems: $('keep').value.split(',').map((s) => s.trim()).filter(Boolean),
+      // Throw junk on the ground rather than walking to the depot the moment the
+      // pack fills. The trip is most of a minute of not farming; a drop is one
+      // tick, so this is what "keep farming until it's unproductive" means.
+      makeRoom: $('make-room').checked,
       // Three independent switches: eating keeps regen up, cooking upgrades raw
       // meat, stacking frees pack slots. They are unrelated jobs and you may
       // well want one without the others.

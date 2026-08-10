@@ -17,6 +17,8 @@
 // between two deploys), and name-matching meant extraction broke silently on the
 // next redeploy.
 
+import { loadItems } from './items.js';
+
 export const INDEX_URL = 'https://avalon.juanandresleon.com/';
 const BUNDLE_RE = /src="(\/assets\/index-[^"]+\.js)"/;
 
@@ -208,6 +210,17 @@ export function extractSurface(js) {
 
 /** Assemble the full {z -> zone} map set (plus a `bundle` version stamp). */
 export function extractAll(js, bundleStamp = null) {
+  // Item weights and equip requirements come out of the same bundle and go
+  // stale the same way, so they are refreshed here rather than at a call site
+  // of their own -- both runtimes already funnel through this function, and a
+  // second entry point is a second place to forget. A failure is a warning, not
+  // a throw: stale weights make the bot's drop choices merely dated, where no
+  // maps at all would walk it into a wall.
+  const got = loadItems(js);
+  if (!got.weights) console.warn('  warn: item weight table not found; using baked copy');
+  if (!got.reqs) console.warn('  warn: item requirement table not found; using baked copy');
+  if (!got.slots) console.warn('  warn: item slot table not found; using baked copy');
+
   const zones = extractUnderground(js);
   let surface = null;
   try {

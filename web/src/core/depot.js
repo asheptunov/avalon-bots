@@ -102,6 +102,17 @@ const BANK_UNTIL_WEIGHT_FRAC = 0.8;
 // More than one because a single moveItem can be lost or race an inventory
 // update; small, because the failure mode this bounds is an infinite loop.
 const DEPOSIT_ATTEMPTS = 3;
+// How long a "the depot is full" verdict stands before we walk over and look
+// again. Long enough that the retry is not the loop it replaces (the spin it
+// fixes ran at ~10 Hz), short enough that a player who empties the box gets a
+// banking bot back within a couple of minutes rather than at the next restart.
+export const DEPOT_FULL_RETRY_S = 120.0;
+
+/** True while a "depot is full" verdict is still in force. */
+export function depotFullRecently(bot) {
+  const at = bot.run?.bankFull;
+  return at != null && depotNow() - at < DEPOT_FULL_RETRY_S;
+}
 
 /** The walkable tile you stand on to use `box`. */
 export function standTile(box) {
@@ -628,9 +639,21 @@ export function bankStep(bot, snap, me, cfg, log) {
     // Every slot at every depth is occupied. Nothing to do but leave: staying
     // would re-offer the same item until the trip timed out, which is the
     // deposit-side twin of the corpse loot loop.
+    //
+    // `bankFull` is what stops leaving from becoming its own loop. Ending the
+    // trip does not empty the pack, so `shouldBank` is still true on the very
+    // next tick and the bot re-latches, walks the half tile back to the box,
+    // opens it, finds it full and leaves again -- measured live at roughly ten
+    // round trips a second, farming nothing and filling the log. The flag
+    // suppresses the trigger for DEPOT_FULL_RETRY_S, which turns a full depot
+    // from a spin into a bot that carries on farming and sheds junk to do it.
     const [dFree, dCap] = depotFree(depot);
+    // Stamped rather than set to `true` so the suppression can expire: the
+    // player empties the box between runs, and a flag with no way back would
+    // mean a bot that never banks again for the rest of a multi-hour session.
+    bot.run.bankFull = depotNow();
     log?.(`!! the depot is full (${dCap - dFree}/${dCap} slots, nested included)`
-      + ' -- store a spare backpack in it to make room');
+      + ' -- store a spare backpack in it to make room; farming on');
     endBanking(bot, log);
     return false;
   }
@@ -677,5 +700,8 @@ export function endBanking(bot, log) {
   // deserves a fresh chance on the next trip, from the right tile.
   bot.run.bankTries = null;
   bot.run.bankSkip = null;
+  // NOT cleared: `bot.run.bankFull`. It is set immediately before this is
+  // called, and clearing it here would undo the suppression on the same tick --
+  // restoring the very spin it exists to stop. It expires on its own clock.
   bot.depot = null;
 }

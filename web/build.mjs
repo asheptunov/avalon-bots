@@ -29,6 +29,9 @@ const MAPS = path.join(HERE, 'maps.json');
 // CLI-only until the panel grows a reason to call them.
 const MODULES = [
   'core/protocol.js',
+  // Above maps.js, which refreshes the item tables from the same bundle it
+  // parses the terrain out of, and above farm.js, which asks them what to drop.
+  'core/items.js',
   'core/maps.js',
   'transport/browser.js',
   'transport/pagemaps.js',

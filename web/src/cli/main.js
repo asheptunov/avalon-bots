@@ -81,6 +81,10 @@ farm flags:
   --night              include night-only spawns (wraiths) when picking a spot
   --until-hp <pct>     stop once HP drops to this
   --no-loot --no-eat --no-cook --no-stack --no-bank
+  --keep <types>       item types this run is FOR, comma-separated: looted
+                       first, never discarded  e.g. shortsword,rubyNecklace
+  --no-make-room       walk to the depot when full instead of dropping junk
+  --junk-oz <n>        don't bother dropping anything lighter    (default 8)
   --bank-free <n>      head to the depot with this many slots left (default 1)
   --no-bank-empty      stop banking at a weight/slot threshold instead of
                        emptying the pack down to food and potions
@@ -247,6 +251,9 @@ async function cmdFarm(args) {
     eat: !args['no-eat'],
     cook: !args['no-cook'],
     stack: !args['no-stack'],
+    keepItems: args.keep ? String(args.keep).split(',').map((s) => s.trim()).filter(Boolean) : [],
+    makeRoom: !args['no-make-room'],
+    junkMinOz: num(args['junk-oz'], 8),
     bank: !args['no-bank'],
     bankFreeSlots: num(args['bank-free'], 1),
     bankEmpty: !args['no-bank-empty'],
