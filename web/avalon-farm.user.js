@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Avalon Farm Bot
 // @namespace    https://github.com/asheptunov/avalon-bots
-// @version      0.11.0
+// @version      0.11.1
 // @description  Drives your on-screen Avalon character: kill / loot / cook / eat / heal.
 // @author       asheptunov
 // @match        https://avalon.juanandresleon.com/*
@@ -2173,20 +2173,73 @@ function nearestTo(xs, anchor) {
  * needs to be able to tell the difference, hence the demotion instead of a
  * filter.
  */
-function nearestHuntable(snap, anchor, huntTypes, claimed = null) {
+function nearestHuntable(snap, anchor, huntTypes, claimed = null,
+                                reachable = null) {
   let best = null; let bestD = Infinity;
   let fallback = null; let fallbackD = Infinity;
   for (const m of snap.monsters) {
     if (m.hp <= 0) continue;
     if (huntTypes && !huntTypes.includes(m.monsterType)) continue;
     const d = distPx(m.x, m.y, anchor.x, anchor.y);
-    if (claimed && claimed.has(m.id)) {
+    // Demoted, not hidden -- same rule as `claimed`, and for the same reason:
+    // when a walled-off monster is all there is, the caller still needs to see
+    // it (self-defense and the log both care), so this only decides ORDER.
+    if ((claimed && claimed.has(m.id)) || (reachable && !reachable(m))) {
       if (d < fallbackD) { fallbackD = d; fallback = m; }
       continue;
     }
     if (d < bestD) { bestD = d; best = m; }
   }
   return best || fallback;
+}
+
+// How far a monster can be before we bother checking whether it is REACHABLE.
+//
+// Prey selection is nearest-by-pixel, and pixels go through walls. The orc caves
+// are not one open room: z=-2 has a 154-tile pocket whose walls put nearby orcs
+// in a different connected region entirely, and z=-1 has the same shape at
+// 63,95. Locking onto one of those means A* returns no path, the chase falls
+// through to pathStep's nudge, and safeStep vetoes every direction because the
+// wall is exactly the thing in the way -- so the bot stands still, indefinitely,
+// swinging at nothing. Measured: 0 movement in 300 consecutive ticks.
+//
+// Anything already at melee range is skipped: it is either genuinely on us or a
+// corner standoff, which meleeStandoff/sidestep already handle, and an A* run
+// per tick per neighbour is not worth paying to re-learn that.
+const REACH_CHECK_PX = MELEE_RANGE_PX;
+
+/**
+ * A predicate answering "can we actually walk to this monster?", cached for the
+ * tick.
+ *
+ * A* per candidate is the honest test and the only one that knows about the
+ * disconnected pockets, but it is also the expensive one, so the result is
+ * memoised per monster id -- prey selection and the fight branch ask about the
+ * same monsters within a tick.
+ */
+function reachChecker(bot, me) {
+  const z = bot.z ?? 0;
+  const blocked = bot.run.occupied || new Set();
+  const from = [nav.tileOf(me.x), nav.tileOf(me.y)];
+  const memo = new Map();
+  return (m) => {
+    if (distPx(m.x, m.y, me.x, me.y) < REACH_CHECK_PX) return true;
+    // A monster landing blows on us is reachable, whatever the grid says, and
+    // the combat event is harder evidence than A* over a map extracted from the
+    // client bundle. Skipping this check is what stops the fix from inventing a
+    // new freeze: filtering out the thing actively eating us would leave the bot
+    // roaming away from a fight it is already in.
+    if (bot.isAttacking(m.id)) return true;
+    const hit = memo.get(m.id);
+    if (hit !== undefined) return hit;
+    const goal = [nav.tileOf(m.x), nav.tileOf(m.y)];
+    // Same tile is trivially reachable -- findPath returns [] for it, which we
+    // must not read as "walled off".
+    const ok = (goal[0] === from[0] && goal[1] === from[1])
+      || nav.findPath(z, from, goal, blocked).length > 0;
+    memo.set(m.id, ok);
+    return ok;
+  };
 }
 
 // How far a monster that has hit us can be and still count as OUR fight.
@@ -3009,6 +3062,31 @@ function handleDialogue(bot, msg, log) {
 const ROAM_CANDIDATES = 8;
 
 /**
+ * Any legal step at all, or [0,0] if genuinely boxed in.
+ *
+ * The last line of defence against a freeze. Every caller above it has a reason
+ * to prefer a particular direction; this one only cares that the bot MOVES,
+ * because every freeze in this file has the same shape -- a tick whose answer
+ * cannot change until the bot stands somewhere else.
+ */
+function anyFreeStep(bot, me) {
+  const z = bot.z ?? 0;
+  const sx = nav.tileOf(me.x); const sy = nav.tileOf(me.y);
+  const blocked = bot.run.occupied || new Set();
+  // Shuffled so a boxed-in bot does not pick the same wall every tick.
+  const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+  for (let i = dirs.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [dirs[i], dirs[j]] = [dirs[j], dirs[i]];
+  }
+  for (const [dx, dy] of dirs) {
+    const step = nav.safeStep(z, sx, sy, dx, dy, blocked);
+    if (step[0] || step[1]) return step;
+  }
+  return [0, 0];
+}
+
+/**
  * Score a prospective roam goal: how far the nearest other player would be,
  * capped at CROWD_PX because past that they are simply not a factor and we would
  * rather not have the bot flee to the map edge to maximise a number.
@@ -3033,25 +3111,42 @@ function roamClearance(goal, others) {
 function roamStep(bot, me, cfg, log, others = []) {
   const t = now();
   let goal = bot.run.farmRoamGoal;
-  if (!goal || since(bot, 'farmRoamSince') > 20.0
+  // A goal we cannot make progress toward is worse than no goal: it is cached
+  // for 20s, and every tick of that is a tick standing still. That is the third
+  // way the bot freezes in a cave -- a random point that lands in rock, or in a
+  // pocket walled off from us. Measured from the z=-1 ledge at 63,95, 30% of
+  // raw random goals commanded no movement at all.
+  const stalled = goal && !navStep(bot, me, goal[0], goal[1]).some(Boolean);
+  if (!goal || stalled || since(bot, 'farmRoamSince') > 20.0
       || distPx(me.x, me.y, goal[0], goal[1]) <= TILE * 1.5) {
     let best = null; let bestScore = -Infinity;
-    const tries = others.length ? ROAM_CANDIDATES : 1;
-    for (let i = 0; i < tries; i++) {
+    // Always sample several now. The old code took the FIRST random angle when
+    // alone, which is exactly when nothing else would shake a bad goal loose.
+    for (let i = 0; i < ROAM_CANDIDATES; i++) {
       const ang = Math.random() * 2 * Math.PI;
       const r = cfg.roamPx * (0.4 + Math.random() * 0.6);
       const cand = [me.x + Math.cos(ang) * r, me.y + Math.sin(ang) * r];
+      // Reject goals we cannot actually walk toward, so the cache only ever
+      // holds a goal that makes progress.
+      if (!navStep(bot, me, cand[0], cand[1]).some(Boolean)) continue;
       const score = others.length ? roamClearance(cand, others) : 0;
       if (score > bestScore) { bestScore = score; best = cand; }
     }
-    goal = best;
-    bot.run.farmRoamGoal = goal;
-    bot.run.farmRoamSince = t;
+    // Every candidate was a dead end (a tight pocket). Keep whatever we had
+    // rather than caching a null and re-sampling 8 goals every tick.
+    if (best) {
+      goal = best;
+      bot.run.farmRoamGoal = goal;
+      bot.run.farmRoamSince = t;
+    }
   }
   farmLog(bot, 'ROAM',
     () => (others.length ? '(no free prey in sight -- drifting off the crowd)'
       : '(no prey in sight)'), log);
-  bot.move(...navStep(bot, me, goal[0], goal[1]));
+  const step = goal ? navStep(bot, me, goal[0], goal[1]) : [0, 0];
+  // Nothing worked -- take any legal step rather than none. Movement is what
+  // makes the next tick's answer different; standing still never resolves.
+  bot.move(...(step.some(Boolean) ? step : anyFreeStep(bot, me)));
 }
 
 // ---- the corner standoff ---------------------------------------------------
@@ -3347,7 +3442,8 @@ function makeFarm(cfg, log) {
     // Loot used to sit behind the fight branch, so on a field that always has
     // another rat in view he never stopped to collect and left every corpse
     // behind. A monster already in melee still comes first.
-    let m = nearestHuntable(snap, me, cfg.huntTypes, claimed);
+    const canReach = reachChecker(bot, me);
+    let m = nearestHuntable(snap, me, cfg.huntTypes, claimed, canReach);
     // Everything in view is somebody else's. Walking away to find our own spawns
     // is a real alternative -- and the issue's rule is that a viable alternative
     // always beats muscling in -- so drop the target and let ROAM take us out of
@@ -3356,6 +3452,16 @@ function makeFarm(cfg, log) {
     if (m && claimed && claimed.has(m.id)) {
       farmLog(bot, 'YIELD',
         () => `${m.monsterType} is another player's -- moving on`, log);
+      m = null;
+    }
+
+    // Everything huntable in view is behind a wall. Standing here staring at it
+    // is the freeze this check exists to prevent -- and unlike YIELD there is no
+    // question of stealing, it is simply not ours to reach. Drop it and let ROAM
+    // move us, which is what makes the next tick's answer different.
+    if (m && !canReach(m)) {
+      farmLog(bot, 'UNREACHABLE',
+        () => `${m.monsterType} is walled off -- roaming for one we can reach`, log);
       m = null;
     }
 
@@ -3417,7 +3523,15 @@ function makeFarm(cfg, log) {
         }
       } else {
         clearMelee(bot);
-        bot.move(...navStep(bot, me, m.x, m.y));
+        let step = navStep(bot, me, m.x, m.y);
+        // A chase that commands no movement is a freeze. It happens when the
+        // target is unroutable -- prey selection drops those, but a DEFEND
+        // target is kept deliberately (it is hitting us), and A* has no path to
+        // a monster shooting across a wall. Circling beats standing still: it is
+        // the same answer the corner standoff gives, for the same reason, and it
+        // is what changes the geometry so the next tick can differ.
+        if (!step[0] && !step[1]) step = sidestep(bot, me, m);
+        bot.move(...step);
         farmLog(bot, state,
           () => `chasing ${m.monsterType} ${(d / TILE).toFixed(1)} tiles`, log);
       }

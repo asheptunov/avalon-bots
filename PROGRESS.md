@@ -8,6 +8,51 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## 2026-08-09 — the bot stops freezing at corners in the orc cave (v0.11.1)
+
+**The symptom.** Dario locks onto an orc some distance off, never moves, and
+stands near a corner until you jitter him loose. Reproduced offline against the
+real extracted maps — no live session needed — and measured: **0 movement in 300
+consecutive ticks**, on the tile he started on.
+
+**It was never one bug.** It is three, all the same shape: a tick whose answer
+cannot change until the bot stands somewhere else.
+
+1. **Prey selection is nearest-by-PIXEL, and pixels go through walls.** The caves
+   are not one open room. z=-2 has a 154-tile pocket around 13,47 and z=-1 the
+   same shape at 63,95, whose nearby orcs are in a *different connected region* —
+   flood fill confirms no path exists. Locking onto one handed A* an unroutable
+   goal; the chase fell through to `pathStep`'s nudge, and `safeStep` vetoed every
+   direction because the wall IS the thing in the way. `nearestHuntable` now takes
+   a `reachable` predicate and **demotes** walled-off prey (same rule as
+   `claimed`, so it is still visible when it is all there is), and the tick drops
+   it with an `UNREACHABLE` log so ROAM relocates us.
+2. **A DEFEND target is kept even when unroutable** — correctly, it is hitting
+   us — so the chase branch could still command `[0,0]`. It now falls back to
+   `sidestep`, the same answer the corner standoff already gives.
+3. **The one that made it intermittent: roaming cached a goal it could not walk
+   to, for 20 seconds.** The goal was a random point with no walkability check,
+   and when alone the bot took the *first* angle it sampled. From the z=-1 ledge,
+   **30% of raw random goals commanded no movement at all** — so he stood still
+   until the cache expired, which is exactly why jittering him by hand worked.
+   Roam now always samples 8 candidates, rejects any it cannot move toward, drops
+   a stalled goal immediately, and falls back to `anyFreeStep` (any legal
+   direction, shuffled) rather than emitting nothing.
+
+Self-defense outranks all of it: `reachChecker` short-circuits on
+`bot.isAttacking(m.id)`, because a landed combat event is harder evidence of
+reachability than A* over a map extracted from the client bundle. Without that
+the fix would have invented a new freeze — roaming away from a fight already
+underway.
+
+**Verified**: the two real freeze sites go 0/300 → **300/300 ticks moving**, and a
+sweep of **1009 (stand, monster) situations across z=-1..-3 finds zero freezes**.
+Cost is 0.005 ms/tick roaming and 1.74 ms/tick worst case (18 unreachable
+monsters in view) against a 100 ms budget. 351 tests (+4, each seen failing
+before the fix).
+
+---
+
 ## 2026-08-08 — the depot sees through nested bags, and the trip empties the pack (#5)
 
 **The bank was full long before it was full.** A depot box has a fixed slot
