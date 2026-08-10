@@ -143,6 +143,149 @@ test('a distant rat is chased, not swung at', () => {
   assert.ok(bot.ofType('move').length > 0, 'must close the distance');
 });
 
+// ---- prey behind a wall (the corner freeze) --------------------------------
+//
+// Prey selection is nearest-by-PIXEL, and pixels go through walls. The orc caves
+// are not one open room: z=-2 has a 154-tile pocket around 13,47 whose orcs sit
+// in a different connected region, and z=-1 has the same shape at 63,95. Locking
+// onto one of those gave A* an unroutable goal, the chase fell through to
+// pathStep's nudge, and safeStep vetoed every direction -- because the wall IS
+// the thing in the way. Measured on the real maps before the fix: zero movement
+// across 300 consecutive ticks, standing on the tile it started on.
+//
+// These run on a synthetic grid so the geometry is legible, and the freeze is
+// asserted as "does it move", which is the symptom the user reported.
+
+/** Two rooms with no door between them: column `wx` is solid wall. */
+const splitMap = (w = 24, h = 12, wx = 12) => {
+  const rows = [];
+  for (let y = 0; y < h; y++) {
+    let r = '';
+    for (let x = 0; x < w; x++) {
+      r += (y === 0 || y === h - 1 || x === 0 || x === w - 1 || x === wx) ? '#' : '.';
+    }
+    rows.push(r);
+  }
+  return rows;
+};
+
+/** Install a map, run the tick, and restore the real maps afterwards. */
+function onMap(rows, fn) {
+  nav.loadMaps({ 0: { widthTiles: rows[0].length, heightTiles: rows.length, rows,
+                      teleports: [], spawns: [] } });
+  try { return fn(); } finally { nav.loadMaps(MAPS); }
+}
+
+test('an orc walled off in another room does not freeze the bot', () => {
+  onMap(splitMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    // Us at x=5, orc at x=18 -- opposite sides of the solid column at x=12.
+    const snap = snapshot([me([5, 5])], [rat([18, 5], 40, 'orc1', 'orc')]);
+    run(bot, snap, hunting());
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0,
+      'must not stand still staring through a wall -- this is the freeze');
+    assert.equal(stateOf(bot), 'ROAM',
+      'unreachable prey falls through to roaming, which is what relocates us');
+  });
+});
+
+test('a reachable orc is preferred over a nearer one behind a wall', () => {
+  onMap(splitMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    // The walled-off orc is CLOSER in pixels; the reachable one is further.
+    const snap = snapshot([me([10, 5])], [
+      rat([14, 5], 40, 'walled', 'orc'),
+      rat([4, 5], 40, 'open', 'orc'),
+    ]);
+    run(bot, snap, hunting());
+    assert.equal(stateOf(bot), 'FIGHT');
+    assert.ok(logs.some((l) => l.includes('open') || !l.includes('walled')),
+      'should be chasing the one it can actually get to');
+    // It must be walking WEST, toward the reachable orc, not east into the wall.
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0 && moves.every((m) => m.dx <= 0),
+      `expected westward movement toward the reachable orc, got ${JSON.stringify(moves)}`);
+  });
+});
+
+test('an orc in the same room is still chased normally', () => {
+  onMap(splitMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    const snap = snapshot([me([3, 5])], [rat([9, 5], 40, 'orc1', 'orc')]);
+    run(bot, snap, hunting());
+    assert.equal(stateOf(bot), 'FIGHT', 'the reach check must not break normal chases');
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0 && moves.every((m) => m.dx >= 0), 'closes eastward');
+  });
+});
+
+// Self-defense outranks the reach check: a monster landing hits on us is
+// reachable by definition, whatever A* thinks of the tile it stands on. Without
+// this ordering the fix would create a NEW freeze -- ignoring the thing eating us.
+test('a monster attacking us is fought even if A* says it is unreachable', () => {
+  onMap(splitMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    // NOTE: the `px()` fixture adds a half tile, so me([10,5]) stands on nav
+    // tile 11 -- just west of the wall column at 12 -- and the bat on tile 14,
+    // in the far room. Pixel-near (~96px), tile-unroutable: exactly the shape
+    // that must survive the reach check because it is hitting us.
+    const snap = snapshot([me([10, 5])], [attacker(bot, [13, 5], 20, 'bat1', 'caveBat')]);
+    run(bot, snap, hunting());
+    // It is 3 tiles off, so the right answer is DEFEND-and-close, not a swing.
+    // What matters is that it stays the target rather than being discarded as
+    // unreachable and roamed away from.
+    assert.equal(stateOf(bot), 'DEFEND',
+      'something hitting us must never be filtered out as unreachable');
+    assert.ok(logs.some((l) => l.includes('caveBat')),
+      'the bat it is defending against should be the one named in the log');
+  });
+});
+
+// The third freeze, and the one that actually made this intermittent: roaming
+// picked a random point with no walkability check and CACHED it for 20 seconds.
+// A goal that lands in rock commands no movement, so the bot stood still until
+// the cache expired -- which is why jittering him by hand unstuck him. Measured
+// from the real z=-1 ledge at 63,95: 30% of raw random goals pinned him.
+test('roaming never settles on a goal it cannot move toward', () => {
+  // The REAL z=-1 ledge at tile 63,95, where this was measured. A synthetic
+  // grid does not reproduce it: nearestWalkable snaps a goal in a small pocket
+  // back onto open ground, so the bad goals only exist at this scale -- a
+  // 151-tile region whose neighbours are a long wall and a separate cave.
+  // (The px() half-tile offset means me([62,94]) stands on nav tile 63,95.)
+  const bot = new FakeBot(backpack([]));
+  bot.z = -1;
+  const snap = { ...snapshot([], []), z: -1 };
+  snap.players = [{ id: 'me', name: 'Dario Amodei', x: 63 * TILE, y: 95 * TILE,
+                    z: -1, hp: 100, maxHp: 100, level: 5 }];
+  // Many independent ticks: the bug is probabilistic (~30% of goals), so one
+  // tick could pass on luck alone. Each fresh bot re-samples the goal.
+  for (let i = 0; i < 60; i++) {
+    bot.sent.length = 0;
+    bot.run = {};
+    run(bot, snap, { ...hunting(), depth: -1 });
+    assert.equal(stateOf(bot), 'ROAM');
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0,
+      `roam commanded no movement on iteration ${i} -- this is the 20s freeze`);
+  }
+});
+
+// The residual freeze the fix above uncovers: a DEFEND target is kept even when
+// unroutable (it is hitting us), so the chase asks A* for a path that does not
+// exist and gets [0,0] back. Standing still while something eats you through a
+// wall is the same bug in a narrower costume.
+test('a chase that cannot be routed sidesteps instead of standing still', () => {
+  onMap(splitMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    const snap = snapshot([me([10, 5])], [attacker(bot, [13, 5], 20, 'bat1', 'caveBat')]);
+    run(bot, snap, hunting());
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0,
+      'an unroutable chase must still move -- [0,0] here is the freeze');
+  });
+});
+
 test('the hunt filter refuses a fight with the 16k-HP training dummy', () => {
   const bot = new FakeBot(backpack([]));
   const snap = snapshot([me()], [rat([10, 10], 20, 'd', 'trainingDummy')]);
