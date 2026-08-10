@@ -604,6 +604,39 @@ test('the enraged flag alone does NOT trigger self-defense', () => {
   assert.equal(attacked, false, 'enraged is not evidence it is fighting US');
 });
 
+// Our OWN hits, which are what the corner standoff reads. The server only emits
+// this event when an attack actually resolved against the target, so its absence
+// while we swing is the one available proof that a wall is in the way.
+
+test('a combat event where WE are the attacker records the landed hit', () => {
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'me', targetId: 'bat-1' }));
+  assert.equal(bot.isHitting('bat-1'), true);
+});
+
+test('someone else hitting that monster is not evidence WE can reach it', () => {
+  // The failure this guards: a crowded room where another player is beating on
+  // the same bat would otherwise look, to us, like our swings were connecting.
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'other-player', targetId: 'bat-1' }));
+  assert.equal(bot.isHitting('bat-1'), false);
+});
+
+test('landing a hit on one monster says nothing about another', () => {
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'me', targetId: 'bat-1' }));
+  assert.equal(bot.isHitting('bat-2'), false);
+});
+
+test('a blocked hit still proves the target is reachable', () => {
+  // flags bit 4 = blocked. The swing resolved -- it just did nothing. That is a
+  // reachability fact, and treating it as a miss would sidestep out of a real
+  // fight against a well-armoured monster.
+  const bot = makeBot();
+  bot.onBinary(combatEvent({ attackerId: 'me', targetId: 'bat-1', damage: 0, flags: 4 }));
+  assert.equal(bot.isHitting('bat-1'), true);
+});
+
 test('a stale attacker is forgotten once its memory window lapses', () => {
   const bot = makeBot();
   bot.onBinary(combatEvent({ attackerId: 'orc-9', targetId: 'me' }));

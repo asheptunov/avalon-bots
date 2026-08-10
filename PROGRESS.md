@@ -575,6 +575,12 @@ Deferred / nice-to-have:
 
 ## Done
 
+- [x] Corner-standoff fix (#7): melee is a pixel test but reachability is the
+  server's, so around a wall a bat could hit us while our swings resolved against
+  nothing — and the fight branch's `move(0, 0)` made that a livelock. The bot now
+  tracks its OWN combat events (`bot.isHitting`); in range and swinging with
+  nothing landing for 1.5s means a wall, and it sidesteps around it. Shared by
+  the farm loop and the swarm's `engage`.
 - [x] Party-readiness model (cohesion/health/threat, hysteresis), parameterized.
 - [x] Leader hunt-move toward nearest prey; escort follow-the-leader.
 - [x] Collision-map extraction (z=-1..-6 ASCII + z=0 via headless Node).

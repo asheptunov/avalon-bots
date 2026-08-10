@@ -987,6 +987,109 @@ function roamStep(bot, me, cfg, log, others = []) {
   bot.move(...navStep(bot, me, goal[0], goal[1]));
 }
 
+// ---- the corner standoff ---------------------------------------------------
+//
+// Melee is decided on straight-line pixel distance, but the server enforces its
+// own reachability. Around a wall corner those disagree: a cave bat can sit well
+// inside MELEE_RANGE_PX with a rock between us. Its own pathing lets it hit us;
+// our swings resolve against nothing.
+//
+// That disagreement used to be a livelock, and the reason is that the fight
+// branch STOPS to swing -- `bot.move(0, 0)`. Standing still is right when the
+// target is really in reach and wrong when it isn't, and the bot had no way to
+// tell the cases apart, so it stood there being eaten while the log cheerfully
+// reported FIGHT. The issue's own fix (\"just move over a little\") works because
+// any movement at all breaks the geometry.
+//
+// The evidence that we are in the bad case is the absence of our own combat
+// events: we are swinging, the monster is inside melee range, and nothing has
+// landed. One tick of that proves nothing -- attacks are on a cooldown of about
+// a second and the loop runs at 10 Hz, so silence is the NORMAL state between
+// swings. Only sustained silence is a standoff.
+export const STANDOFF_S = 1.5;
+
+// How long to keep sidestepping once we commit. A single tick of movement is
+// not enough to clear a corner (one tick is a few pixels), and re-deciding every
+// tick makes the bot vibrate on the spot rather than actually going anywhere.
+const SIDESTEP_S = 0.6;
+
+/**
+ * True when we appear to be in melee with `m` but nothing we swing is landing.
+ *
+ * Requires having been in the fight for STANDOFF_S: `farmMeleeSince` is set on
+ * the first tick we are in range of this target and cleared whenever the target
+ * changes, so the clock measures time spent swinging at THIS monster, not time
+ * since the run began.
+ */
+export function inStandoff(bot, m) {
+  const since0 = bot.run.farmMeleeSince;
+  if (since0 === undefined || m.id !== bot.run.farmMeleeTarget) return false;
+  if (now() - since0 < STANDOFF_S) return false;
+  return !bot.isHitting(m.id, STANDOFF_S);
+}
+
+/**
+ * Note that we are in melee with `m`, and answer whether the swing is landing.
+ *
+ * Keeping the bookkeeping next to the test matters: the clock has to start on
+ * the first in-range tick, and it has to reset when we switch targets, or a long
+ * fight with one monster would make the next monster look stuck instantly.
+ */
+export function meleeStandoff(bot, m) {
+  if (bot.run.farmMeleeTarget !== m.id) {
+    bot.run.farmMeleeTarget = m.id;
+    bot.run.farmMeleeSince = now();
+    bot.run.farmSidestepUntil = undefined;
+    return false;
+  }
+  return inStandoff(bot, m);
+}
+
+/** Forget the melee clock -- we are no longer toe to toe with anything. */
+export function clearMelee(bot) {
+  bot.run.farmMeleeTarget = undefined;
+  bot.run.farmMeleeSince = undefined;
+  bot.run.farmSidestepUntil = undefined;
+}
+
+/**
+ * A step that circles `m` instead of pressing into it.
+ *
+ * Perpendicular to the line to the target, so we slide ALONG the wall rather
+ * than into it -- stepping straight back just re-runs the approach and re-enters
+ * the same standoff. safeStep vetoes it against the collision grid, and when
+ * both perpendicular directions are walled we fall back to the reverse, which is
+ * the one remaining way out of a dead end.
+ *
+ * The direction is chosen once per sidestep and held for SIDESTEP_S (stored on
+ * `bot.run`), because alternating each tick is the jitter that goes nowhere.
+ */
+export function sidestep(bot, me, m) {
+  const z = bot.z ?? 0;
+  const sx = nav.tileOf(me.x); const sy = nav.tileOf(me.y);
+  const blocked = bot.run.occupied || new Set();
+  let dir = bot.run.farmSidestepDir;
+  if (dir === undefined || !(now() < (bot.run.farmSidestepUntil ?? -Infinity))) {
+    dir = Math.random() < 0.5 ? 1 : -1;
+    bot.run.farmSidestepDir = dir;
+    bot.run.farmSidestepUntil = now() + SIDESTEP_S;
+  }
+  const [tx, ty] = stepToward(me, m.x, m.y);
+  // Rotate the approach vector 90 degrees, in the chosen handedness. The last
+  // candidate is the reverse -- the only way out of a dead end, once both
+  // perpendiculars are walled.
+  const cands = [[-ty * dir, tx * dir], [ty * dir, -tx * dir], [-tx, -ty]];
+  // Sub-pixel separation rounds the approach vector to (0,0) -- two entities on
+  // one tile -- and rotating that yields nothing to try. Any free direction
+  // breaks the geometry just as well, which is all the sidestep needs.
+  cands.push([1, 0], [-1, 0], [0, 1], [0, -1]);
+  for (const [dx, dy] of cands) {
+    const step = nav.safeStep(z, sx, sy, dx, dy, blocked);
+    if (step[0] || step[1]) return step;
+  }
+  return [0, 0];
+}
+
 /**
  * Heartbeat: farming runs for hours, so print on a timer rather than at 10 Hz.
  * Always prints when the state changes. `detail` is a callable so the ~98% of
@@ -1182,14 +1285,26 @@ export function makeFarm(cfg, log) {
       const state = defending ? 'DEFEND' : 'FIGHT';
       const d = distPx(m.x, m.y, me.x, me.y);
       if (d < MELEE_RANGE_PX) {
-        bot.move(0, 0);
+        // Keep swinging either way -- the attack is what tells us whether we can
+        // reach it, so going quiet while we reposition would make the standoff
+        // permanent by removing its own evidence.
         bot.attack(m.id);
-        // FIGHT and CHASE are one state for logging: closing the last few px
-        // flips between them several times a second.
-        farmLog(bot, state,
-          () => `${m.monsterType} ${m.hp}/${m.maxHp} hp=${me.hp}`
-            + (defending ? ' (it attacked us)' : ''), log);
+        if (meleeStandoff(bot, m)) {
+          // In range, swinging, nothing landing: a wall is between us. Slide
+          // around it rather than standing still being chewed on.
+          bot.move(...sidestep(bot, me, m));
+          farmLog(bot, state,
+            () => `${m.monsterType} is behind a corner -- stepping around it`, log);
+        } else {
+          bot.move(0, 0);
+          // FIGHT and CHASE are one state for logging: closing the last few px
+          // flips between them several times a second.
+          farmLog(bot, state,
+            () => `${m.monsterType} ${m.hp}/${m.maxHp} hp=${me.hp}`
+              + (defending ? ' (it attacked us)' : ''), log);
+        }
       } else {
+        clearMelee(bot);
         bot.move(...navStep(bot, me, m.x, m.y));
         farmLog(bot, state,
           () => `chasing ${m.monsterType} ${(d / TILE).toFixed(1)} tiles`, log);

@@ -261,6 +261,121 @@ test('the hunted monster still wins when nothing is attacking us', () => {
   assert.equal(stateOf(bot), 'FIGHT');
 });
 
+// ---- the corner standoff ---------------------------------------------------
+//
+// Melee is decided on pixel distance; the server enforces its own reachability.
+// Around a wall corner they disagree, and the fight branch's `move(0, 0)` turned
+// that disagreement into a livelock: the bot stopped dead, swung at a rock, and
+// was eaten by a cave bat it could not reach while the log said FIGHT.
+//
+// The evidence of the bad case is the absence of OUR combat events while we are
+// in range and swinging -- so these drive it the way the wire does, through
+// bot.lastHitAt, rather than asserting on a flag no server sends.
+
+/** Pretend we have been toe to toe with `mid` for `s` seconds already. */
+function inMeleeFor(bot, mid, s) {
+  bot.run.farmMeleeTarget = mid;
+  bot.run.farmMeleeSince = (performance.now() / 1000) - s;
+}
+
+/** Record that one of our swings just landed on `mid`, as the wire would. */
+function weHit(bot, mid) {
+  bot.lastHitAt = bot._now();
+  bot.lastHitTargetId = mid;
+}
+
+test('a monster we cannot reach is stepped around, not stood in front of', () => {
+  // The bug, reduced: in range, swinging, and nothing of ours has landed for
+  // longer than a swing cooldown. Standing still here is what got us killed.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  run(bot, snap, hunting());          // first tick starts the melee clock
+  inMeleeFor(bot, 'bat1', 5);         // ...and five seconds of nothing landing
+  run(bot, snap, hunting());
+  const move = bot.ofType('move').at(-1);
+  assert.ok(move.dx !== 0 || move.dy !== 0,
+    'must move to break the standoff instead of holding still');
+});
+
+test('we keep swinging while stepping around the corner', () => {
+  // The attack is the only evidence of whether we can reach it. Going quiet to
+  // reposition would delete the standoff's own signal and make it permanent.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  run(bot, snap, hunting());
+  inMeleeFor(bot, 'bat1', 5);
+  bot.sent.length = 0;
+  run(bot, snap, hunting());
+  assert.equal(bot.ofType('attack').at(-1)?.targetId, 'bat1');
+});
+
+test('a fight that IS landing hits stands its ground', () => {
+  // The other half of the rule, and the one that stops this collapsing into
+  // "always jitter": when our swings connect, holding position is correct.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  run(bot, snap, hunting());
+  inMeleeFor(bot, 'bat1', 5);
+  weHit(bot, 'bat1');                 // our damage is landing
+  run(bot, snap, hunting());
+  const move = bot.ofType('move').at(-1);
+  assert.deepEqual([move.dx, move.dy], [0, 0], 'reachable -- do not wander off');
+});
+
+test('a fresh melee is given time before being called a standoff', () => {
+  // Attacks are on a ~1s cooldown and the loop runs at 10 Hz, so silence between
+  // swings is the NORMAL state. Reacting to one quiet tick would make the bot
+  // sidestep out of every fight it ever started.
+  const bot = new FakeBot(backpack([]));
+  const snap = snapshot([me([10, 10])], [attacker(bot, [10, 10])]);
+  run(bot, snap, hunting());
+  run(bot, snap, hunting());
+  const move = bot.ofType('move').at(-1);
+  assert.deepEqual([move.dx, move.dy], [0, 0], 'too early to conclude anything');
+});
+
+test('switching targets restarts the clock rather than inheriting it', () => {
+  // A long fight with one monster must not make the NEXT one look stuck the
+  // instant we turn to it.
+  const bot = new FakeBot(backpack([]));
+  const first = snapshot([me([10, 10])], [attacker(bot, [10, 10], 20, 'bat1')]);
+  run(bot, first, hunting());
+  inMeleeFor(bot, 'bat1', 5);
+  const second = snapshot([me([10, 10])], [attacker(bot, [10, 10], 20, 'bat2')]);
+  run(bot, second, hunting());
+  const move = bot.ofType('move').at(-1);
+  assert.deepEqual([move.dx, move.dy], [0, 0], 'bat2 is a brand new fight');
+});
+
+test('chasing clears the melee clock, so arriving is a fresh fight', () => {
+  // Without this a bot that fought, lost the target, chased it down and caught it
+  // again would be instantly "in a standoff" on arrival.
+  const bot = new FakeBot(backpack([]));
+  run(bot, snapshot([me([10, 10])], [attacker(bot, [10, 10])]), hunting());
+  inMeleeFor(bot, 'bat1', 5);
+  run(bot, snapshot([me([10, 10])], [attacker(bot, [16, 10])]), hunting());
+  assert.equal(bot.run.farmMeleeSince, undefined, 'the clock is reset by the chase');
+});
+
+test('the sidestep goes around the target, never straight into it', () => {
+  // Stepping toward the monster just re-runs the approach and re-enters the same
+  // standoff; the step has to be perpendicular (or, in a dead end, back out).
+  const bot = new FakeBot(backpack([]));
+  const m = rat([12, 10]);            // due east of us
+  const step = farm.sidestep(bot, me([10, 10]), m);
+  assert.notDeepEqual(step, [1, 0], 'must not press into the wall we are stuck on');
+  assert.ok(step[0] !== 0 || step[1] !== 0, 'and it must actually move');
+});
+
+test('a monster on our own tile still produces a step', () => {
+  // Sub-pixel separation rounds the approach vector to (0,0), and rotating that
+  // yields nothing -- so the bot would freeze in exactly the standoff it just
+  // decided to break out of.
+  const bot = new FakeBot(backpack([]));
+  const step = farm.sidestep(bot, me([10, 10]), rat([10, 10]));
+  assert.ok(step[0] !== 0 || step[1] !== 0, 'any direction beats standing still');
+});
+
 test('being attacked outranks the hunted monster across the room', () => {
   // The orc we came for is 8 tiles off; the bat is in our face. Walking to the
   // orc means eating hits the whole way and arriving hurt.

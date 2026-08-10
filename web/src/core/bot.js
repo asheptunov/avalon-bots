@@ -41,6 +41,17 @@ export class AvalonBot {
     this.groundItems = [];   // last known floor contents (see onBinary)
     this.z = null;
     this.fleeing = false;
+    // Timestamp (seconds) of the last hit WE landed on anything, and on whom.
+    //
+    // The mirror image of attackedBy, and it exists for the corner standoff (see
+    // farm.js's unreachable check). Melee is decided on pixel distance, but the
+    // server enforces its own reachability: around a wall corner a monster can be
+    // well inside MELEE_RANGE_PX and still be unhittable. Nothing in the snapshot
+    // says so -- the only evidence is the absence of our own combat events while
+    // we are swinging. So we record when we last connected; a fight where we are
+    // attacking and this never advances is a fight we are not really in.
+    this.lastHitAt = -Infinity;
+    this.lastHitTargetId = null;
     // monsterId -> timestamp (seconds) of the last hit it landed on us.
     //
     // This is the ONLY reliable "who is attacking me" signal the server gives.
@@ -248,6 +259,14 @@ export class AvalonBot {
       if (ev.targetId === this.me && ev.attackerId) {
         this.attackedBy.set(ev.attackerId, this._now());
       }
+      // Our own swing connecting. A blocked hit still counts: the server only
+      // sends this when the attack actually resolved against the target, which
+      // is precisely the "we can reach it" fact the corner check needs. A swing
+      // at something behind a wall produces no event at all.
+      if (ev.attackerId === this.me && ev.targetId) {
+        this.lastHitAt = this._now();
+        this.lastHitTargetId = ev.targetId;
+      }
       return null;
     }
     // Death notices carry nothing the farm loop needs -- it reads hp straight
@@ -266,6 +285,12 @@ export class AvalonBot {
    * entry per monster that ever landed a blow, and every one of them gets tested
    * on every tick.
    */
+  /** True if one of OUR attacks landed on `monsterId` within `withinS`. */
+  isHitting(monsterId, withinS = ATTACKER_MEMORY_S) {
+    if (this.lastHitTargetId !== monsterId) return false;
+    return this._now() - this.lastHitAt <= withinS;
+  }
+
   isAttacking(monsterId, withinS = ATTACKER_MEMORY_S) {
     const at = this.attackedBy.get(monsterId);
     if (at === undefined) return false;

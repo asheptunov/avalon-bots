@@ -14,7 +14,7 @@ import { TILE, MELEE_RANGE_PX } from './protocol.js';
 import * as nav from './nav.js';
 import {
   distPx, meOf, nameMatches, stepToward, setNavObstacles, navStep,
-  nearestTo, respawnIfDead, takeTeleport,
+  nearestTo, respawnIfDead, takeTeleport, meleeStandoff, clearMelee, sidestep,
 } from './farm.js';
 
 const now = () => performance.now() / 1000;
@@ -657,12 +657,21 @@ export function swarmTarget(intentMode, snap, leader, anchor, members,
 
 // ---- the machines ---------------------------------------------------------
 
-/** Close to melee and swing, else path toward it. Shared by both roles. */
+/**
+ * Close to melee and swing, else path toward it. Shared by both roles.
+ *
+ * The corner standoff applies here for the same reason it does in the farm loop:
+ * melee is a pixel test, reachability is the server's, and around a wall those
+ * disagree. A pack member frozen against a rock is worse than a lone bot doing
+ * it -- the focus-fire gate keeps the rest of the party committed to a target
+ * nobody can actually hit. See farm.js's meleeStandoff.
+ */
 function engage(bot, me, target) {
   if (distPx(me.x, me.y, target.x, target.y) < MELEE_RANGE_PX) {
-    bot.move(0, 0);
     bot.attack(target.id);
+    bot.move(...(meleeStandoff(bot, target) ? sidestep(bot, me, target) : [0, 0]));
   } else {
+    clearMelee(bot);
     bot.move(...navStep(bot, me, target.x, target.y));
   }
 }

@@ -641,6 +641,25 @@ test('a follow escort joins the leader\'s fight once the gate opens', () => {
   assert.ok(attacked(bot), 'readiness 1.0 -> engage the leader\'s target');
 });
 
+test('an escort stuck on a corner steps around it instead of freezing', () => {
+  // The same corner standoff the farm loop has, and worse in a pack: the
+  // focus-fire gate keeps everyone committed to a target nobody can reach.
+  nav.loadMaps(OPEN_MAP);
+  const bot = makeBot();
+  const leader = P({ id: 'L', name: 'lead', x: TILE * 10, y: TILE * 10 });
+  const me = P({ id: 'me', name: 'esc', x: TILE * 10, y: TILE * 10 });
+  const mob = M({ id: 'r', hp: 5, x: TILE * 10 + 8, y: TILE * 10, enraged: true });
+  const snap = snapOf([leader, me], [mob]);
+  const opts = { cfg: cfgOf({ combatThreshold: 0.5 }) };
+  escortTick(bot, snap, opts);                      // starts the melee clock
+  bot.run.farmMeleeSince = (performance.now() / 1000) - 5;   // ...and nothing lands
+  escortTick(bot, snap, opts);
+  const move = lastMove(bot);
+  assert.ok(move && (move[0] !== 0 || move[1] !== 0),
+    'a party member must not stand still swinging at a rock');
+  assert.ok(attacked(bot), 'and it keeps swinging -- that is the reachability signal');
+});
+
 test('a follow escort holds station instead of engaging when readiness is low', () => {
   nav.loadMaps(OPEN_MAP);
   const bot = makeBot();
