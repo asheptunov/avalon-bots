@@ -54,6 +54,23 @@ respawn-at-home was added, re-killed the same corpse under its feet every tick.
 A metric that cannot separate the builds is not evidence; the respawn timer is
 what finally made travel time dominate.
 
+**The release caught a flake I had shipped.** `npm test` passed locally, but the
+v0.11.2 Release job went **red on `roaming heads away from the crowd`** — a
+pre-existing statistical test (40 samples, threshold 70%) that my change had
+tipped over. Running the suite 10x showed **3/10 failing**; the single local green
+run was luck. Cause: `ROAM_MIN_TILES` started as a hard `continue`, which shrank
+the candidate pool *before* crowd scoring saw it and sometimes discarded the goal
+that best avoided other players — a distance filter overruling the courtesy rule.
+Two wrong fixes preceded the right one (scaling the score, then splitting the
+criteria); both were disproved by rerunning, and isolating the constant is what
+actually found it. It is now a **preference, not a veto**: a lexicographic
+`[longEnough, clearanceOrDistance]`, so a too-short goal is merely outranked and
+is still taken when a tight pocket offers nothing better. **0 failures across 30
+suite runs**, and the stall cure is intact (53 tiles / 28.5 away).
+
+Lesson for next time: for anything with `Math.random()` in it, one green run is
+not a pass. Loop the suite.
+
 **Rejected on evidence:** ranking prey by path length instead of pixels. Sounds
 right, but nearest-by-pixel disagrees with nearest-by-path in only **5.7% of 1851
 situations, median 1.0x and worst 2.8x extra walking** — the mispick is not what

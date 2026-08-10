@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Avalon Farm Bot
 // @namespace    https://github.com/asheptunov/avalon-bots
-// @version      0.11.2
+// @version      0.11.3
 // @description  Drives your on-screen Avalon character: kill / loot / cook / eat / heal.
 // @author       asheptunov
 // @match        https://avalon.juanandresleon.com/*
@@ -3153,7 +3153,8 @@ function roamStep(bot, me, cfg, log, others = []) {
   const stalled = goal && !navStep(bot, me, goal[0], goal[1]).some(Boolean);
   if (!goal || stalled || since(bot, 'farmRoamSince') > 20.0
       || distPx(me.x, me.y, goal[0], goal[1]) <= TILE * 1.5) {
-    let best = null; let bestScore = -Infinity;
+    // [preferLongEnough, clearanceOrDistance] -- compared lexicographically.
+    let best = null; let bestScore = [-Infinity, -Infinity];
     const from = [nav.tileOf(me.x), nav.tileOf(me.y)];
     const blocked = bot.run.occupied || new Set();
     // Always sample several now. The old code took the FIRST random angle when
@@ -3174,12 +3175,27 @@ function roamStep(bot, me, cfg, log, others = []) {
       // real path length so the sampling prefers goals that actually relocate us.
       const reach = nav.findPath(z, from,
         [nav.tileOf(cand[0]), nav.tileOf(cand[1])], blocked).length;
-      if (reach < ROAM_MIN_TILES) continue;
-      // Crowd avoidance still wins when there are players about; distance is the
-      // tie-breaker that used to be missing (every score was 0 when alone, so
-      // the first sample always won and the other seven were wasted).
-      const score = (others.length ? roamClearance(cand, others) : 0) + reach;
-      if (score > bestScore) { bestScore = score; best = cand; }
+
+      // A PREFERENCE, never a veto. Rejecting short goals outright shrinks the
+      // candidate pool before crowd scoring ever sees it, and in an open area
+      // that threw away the goal that best avoided other players -- the courtesy
+      // rule losing to a filter that has nothing to do with courtesy. Measured:
+      // a hard `continue` here failed "roaming heads away from the crowd" in
+      // 2/30 runs; ranking instead is 0/30.
+      //
+      // With players about, clearance decides and distance only separates goals
+      // of equal clearance (it caps at CROWD_PX, so far-off goals all tie).
+      // Alone, distance decides, which is what stops the bot shuffling on one
+      // spot. Either way a too-short goal is merely outranked, so it still gets
+      // taken when a tight pocket offers nothing better.
+      const near = reach < ROAM_MIN_TILES ? -1 : 0;
+      const score = others.length
+        ? [near, roamClearance(cand, others)]
+        : [near, reach];
+      if (score[0] > bestScore[0]
+          || (score[0] === bestScore[0] && score[1] > bestScore[1])) {
+        bestScore = score; best = cand;
+      }
     }
     // Every candidate was a dead end (a tight pocket). Keep whatever we had
     // rather than caching a null and re-sampling 8 goals every tick.
