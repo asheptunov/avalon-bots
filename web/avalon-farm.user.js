@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Avalon Farm Bot
 // @namespace    https://github.com/asheptunov/avalon-bots
-// @version      0.9.0
+// @version      0.10.0
 // @description  Drives your on-screen Avalon character: kill / loot / cook / eat / heal.
 // @author       asheptunov
 // @match        https://avalon.juanandresleon.com/*
@@ -3138,6 +3138,14 @@ function makeFarm(cfg, log) {
     const spot = huntSpot(bot, cfg);
     if (spot) cfg.depth = spot.z;
 
+    // A bank run overrides the hunt's floor: the depot is on the surface, so
+    // while the trip is latched we want to be at z=0 and not one step below it.
+    // Setting cfg.depth here is what makes the climb happen at all -- climbStep
+    // fires on `z < cfg.depth`, so with depth pinned to the cave the bot was
+    // already "on the right floor" and nothing ever walked it out. Reverts the
+    // moment banking ends, and travelStep/descendStep then take it back down.
+    if (bot.run.banking) cfg.depth = DEPOT_Z;
+
     setNavObstacles(bot, snap, me, cfg.depth);
 
     if (respawnIfDead(bot, me, log)) return;
@@ -3199,15 +3207,52 @@ function makeFarm(cfg, log) {
     // on is strictly worse than the walk to the depot. Latched, because the trip
     // has to survive the rats we pass on the way -- without the latch the first
     // rat in view would pull us back into FIGHT one tile from the box.
-    // Only underground when there is no depot to walk to. bankStep declines every
-    // tick off z=0, so latching the trip down there sets `banking` for good: the
-    // bot then farms on with a full pack while permanently believing it is on a
-    // bank run. Harmless when the CLI pinned us below with --depth, but travel
-    // routes bots underground as a matter of course, so it is now the normal case.
-    if (!bot.run.banking && (bot.z ?? 0) === DEPOT_Z && shouldBank(bot, cfg)) {
+    // Underground counts too, and used to not: the trigger was gated on
+    // `z === DEPOT_Z`, so a bot that filled its pack in a cave never latched and
+    // farmed on forever dropping loot it could not carry. Since travel routes
+    // bots underground as a matter of course, that was the normal case rather
+    // than the exception -- the pack simply never got banked.
+    //
+    // What makes latching down there safe now is the cfg.depth override at the
+    // top of the tick: it points climbStep at the surface, so the ladder walk out
+    // is a real step the trip makes rather than a state the bot is stuck in. The
+    // old comment's fear (latching sets `banking` for good because bankStep
+    // declines every tick off z=0) was correct about the code as it stood.
+    // `bankStranded` is set when the climb out proved impossible (below), and
+    // suppresses the trigger for the rest of the run on that floor. Without it
+    // the give-up re-latches on the very next tick -- shouldBank is still true,
+    // the pack is still full -- and the log fills with one abandoned bank run per
+    // 100 ms. Cleared by climbStep succeeding for any other reason, since a bot
+    // that has changed floors deserves a fresh look.
+    if (!bot.run.banking && !bot.run.bankStranded && shouldBank(bot, cfg)) {
       bot.run.banking = true;
+      // Retarget the floor on the tick that latches, not just from the next one
+      // onwards: the override at the top of the tick reads `banking`, which was
+      // still false when it ran. Without this the climb loses its first tick and
+      // -- worse -- setNavObstacles has already treated the trapdoors as open for
+      // a descent we are no longer making.
+      cfg.depth = DEPOT_Z;
       const [free, cap] = bot.packSpace();
-      log?.(`pack ${cap - free}/${cap} -- heading to the depot`);
+      const where = (bot.z ?? 0) === DEPOT_Z ? '' : ` from z${bot.z}`;
+      log?.(`pack ${cap - free}/${cap} -- heading to the depot${where}`);
+    }
+    // Climb out before bankStep gets a look: it declines every tick off z=0, so
+    // on a cave floor this is the branch that actually advances the trip.
+    //
+    // A floor with no way up abandons the trip rather than latching on it. That
+    // is the exact state the pre-climb code was written to avoid -- `banking` set
+    // for good while bankStep declines every tick -- and climbStep returning
+    // false is the one case that still reaches it. Better to farm on with a full
+    // pack (the old behaviour) than to stand in a hole believing we are shopping.
+    if (bot.run.banking && (bot.z ?? 0) < DEPOT_Z) {
+      if (climbStep(bot, me, cfg, log)) return;
+      log?.(`!! no way up from z${bot.z} -- giving up on the bank run`);
+      bot.run.bankStranded = bot.z ?? 0;
+      endBanking(bot, log);
+    } else if (bot.run.bankStranded != null && bot.run.bankStranded !== (bot.z ?? 0)) {
+      // Moved off the floor we were stranded on -- the depot may be reachable
+      // from here, so allow the trigger again.
+      bot.run.bankStranded = null;
     }
     if (bot.run.banking && bankStep(bot, snap, me, cfg, log)) return;
 

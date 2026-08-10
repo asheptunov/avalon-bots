@@ -1144,21 +1144,22 @@ test('the trapdoor to the target floor is not treated as a wall', () => {
     'the hole we are travelling to must stay open to the pathfinder');
 });
 
-// Banking is a surface-only trip -- bankStep declines every tick off z=0, since
-// there is no depot underground. Latching `banking` down there therefore sets it
-// for good: the bot farms on with a full pack while permanently believing it is on
-// a bank run, and the real trip never happens once it climbs out. Harmless while
-// only --depth put bots underground; now that travel routes them there by default
-// it is the normal case.
-test('a full pack underground does not latch a bank trip that cannot run', () => {
+// Banking used to be a surface-only trip: the trigger was gated on being ON z=0,
+// so a bot that filled its pack in a cave never latched and farmed on dropping
+// loot it could not carry. That was tolerable while only --depth put bots
+// underground; once travel started routing them there by default it meant the
+// pack was never banked at all. The trip now starts underground and climbs out,
+// with cfg.depth retargeted at the surface so climbStep actually fires.
+test('a full pack underground latches the trip and heads for the surface', () => {
   const bot = new FakeBot(backpack(
     Array.from({ length: 8 }, (_, i) => item('emberOre', 1, `ore${i}`))));
   bot.z = -1;
   const snap = snapshot([me([68, 16])], []);
   snap.z = -1;
   run(bot, snap, { huntTypes: ['caveBat'] });
-  assert.ok(!bot.run.banking,
-    'no depot down here, so the trip must not be latched until we surface');
+  assert.ok(bot.run.banking,
+    'a full pack is worth the walk out, not more un-lootable kills');
+  assert.equal(bot.run.farmState, 'CLIMB', 'and the first step is the way up');
 });
 
 test('a full pack on the surface still banks', () => {

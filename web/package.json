@@ -1,6 +1,6 @@
 {
   "name": "avalon-bots",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Avalon MMO bot: one core, two transports (browser userscript + headless CLI)",
   "type": "module",
   "bin": {

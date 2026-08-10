@@ -242,14 +242,63 @@ test('the trip is latched -- a rat on the way does not cancel it', () => {
   assert.equal(bot.run.farmState, 'BANK');
 });
 
-test('underground, banking does not apply', () => {
-  // There is no depot below the surface and no way to reach one without
-  // unwinding the descent -- so a full pack underground keeps farming.
+test('a full pack underground climbs out to reach the depot', () => {
+  // The bug this pins: the trigger was gated on being ON z=0, so a bot that
+  // filled up in a cave never latched -- it farmed on forever, dropping every
+  // further kill's loot on the floor. Since travel routes bots underground for
+  // any monster that lives there, that was the normal case, and the symptom was
+  // "he never returns to bank". The trip now starts down there and the walk out
+  // is its first step.
   const bot = new FakeBot(junk(8));
   bot.z = -1;
+  // A real cave tile with a real way up: the ladder table is the same one
+  // climbStep reads, so asserting on CLIMB here asserts against the world.
+  const up = nav.nearestUpwardTeleport(-1, [10, 10]);
+  assert.ok(up, 'fixture needs a z=-1 floor with a ladder out');
   const snap = { ...snapshot([me([10, 10])], [rat([10, 10])]), z: -1 };
   run(bot, snap, { depth: -1 });
+  assert.ok(bot.run.banking, 'should latch the trip underground');
+  assert.equal(bot.run.farmState, 'CLIMB', 'and walk toward the way up');
+});
+
+test('the bank run retargets the floor, so the climb is not undone', () => {
+  // cfg.depth is recomputed every tick from the hunt spot. If banking did not
+  // override it, climbStep would read the bot as already on the right floor and
+  // never fire -- the trip would latch and then sit there. This is the assertion
+  // that the override actually lands.
+  const bot = new FakeBot(junk(8));
+  bot.z = -1;
+  const c = cfg({ depth: -1 });
+  const snap = { ...snapshot([me([10, 10])], [rat([10, 10])]), z: -1 };
+  farm.makeFarm(c, () => {})(bot, snap);
+  assert.ok(bot.run.banking);
+  assert.equal(c.depth, depot.DEPOT_Z, 'depth should point at the surface');
+});
+
+test('underground with no way up, the trip is abandoned rather than latched', () => {
+  // The failure the old z-gate existed to prevent: `banking` set for good while
+  // bankStep declines every tick off z=0, so the bot farms on believing it is
+  // shopping. A floor with no ladder is the one case that still reaches it, so
+  // it gives up and goes back to farming -- and does not re-latch every tick.
+  const bot = new FakeBot(junk(8));
+  // A floor with no ladder out. Rather than stub nav (its module namespace is
+  // frozen, so the export cannot be reassigned), use a z the teleport table has
+  // no upward link from -- which is the same condition climbStep tests.
+  const orphan = [...Array(40).keys()]
+    .map((i) => -1 - i)
+    .find((z) => nav.nearestUpwardTeleport(z, [10, 10]) == null);
+  assert.ok(orphan != null, 'fixture needs a floor with no way up');
+  bot.z = orphan;
+  const snap = { ...snapshot([me([10, 10])], [rat([10, 10])]), z: orphan };
+  run(bot, snap, { depth: orphan });
+  assert.ok(!bot.run.banking, 'should not stay latched with no way out');
   assert.notEqual(bot.run.farmState, 'BANK');
+  // Second tick: the pack is still full, so without the stranded flag the
+  // trigger fires again and the log fills with abandoned trips.
+  run(bot, snap, { depth: orphan });
+  assert.ok(!bot.run.banking, 'and should not re-latch on the next tick');
+  assert.ok(!logs.some((m) => /heading to the depot/.test(m)),
+    'no repeated trip announcements');
 });
 
 // ---- getting there and opening it -----------------------------------------
