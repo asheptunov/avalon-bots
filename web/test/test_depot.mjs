@@ -417,6 +417,107 @@ test('surplus food above the reserve IS stowed, as a partial stack', () => {
   assert.equal(next.quantity, 15, '25 held - 10 reserved');
 });
 
+test('a spare torch is banked -- the one we light is equipped', () => {
+  // The torch used to be a keeper, on the reasoning that you cannot improvise
+  // one underground. But the lit torch is EQUIPPED, and nextDeposit walks the
+  // pack only, so keeping one in the bag protected nothing and cost 12oz -- six
+  // times the heaviest food -- plus a slot, every trip.
+  const bot = new FakeBot({
+    leftHand: item('torch', 1, 'lit'),
+    backpack: item('backpack', 1, 'pack', [item('torch', 1, 'spare'), null]),
+  });
+  const next = depot.nextDeposit(bot);
+  assert.ok(next, 'the spare is haul');
+  assert.equal(next.item.instanceId, 'spare');
+  // And the equipped one is still untouchable, for the same reason as the sword.
+  const pack = bot.backpack();
+  pack.contents = [null, null];
+  assert.equal(depot.nextDeposit(bot), null, 'the equipped torch is not in the pack');
+});
+
+test('only one food type is kept -- the largest stack wins', () => {
+  // Five kinds of food is five slots doing one slot's job: every food restores
+  // regen identically and only the wellFed duration differs. The slot is the
+  // scarce thing on a bank trip, so the biggest stack wins even against
+  // longer-lasting food.
+  assert.equal(depot.foodToKeep([
+    item('cookedMeat', 11, 'm'), item('apple', 1, 'a'), item('fish', 2, 'f'),
+  ]), 'cookedMeat', '11 meat beats 2 fish despite fish lasting longer');
+
+  // Split stacks of the same food count together -- cookAndStack merges them
+  // every tick, so their combined size is what that food is really worth.
+  assert.equal(depot.foodToKeep([
+    item('apple', 4, 'a1'), item('apple', 4, 'a2'), item('cheese', 6, 'c'),
+  ]), 'apple', '4+4 apples outweigh 6 cheese once merged');
+
+  // Ties go to the longer-lasting food, by FOOD_PREFERENCE order.
+  assert.equal(depot.foodToKeep([
+    item('apple', 3, 'a'), item('fish', 3, 'f'),
+  ]), 'fish', 'equal stacks -> the better food');
+
+  assert.equal(depot.foodToKeep([item('dagger', 1, 'j')]), null, 'no food at all');
+});
+
+test('the reserve caps what a stack is worth when choosing the food', () => {
+  // A stack of 40 apples against a reserve of 10 is worth 10 kept apples, not
+  // 40. Ranking on the raw count would keep the food with the most surplus to
+  // bank -- the opposite of the point.
+  assert.equal(depot.foodToKeep([
+    item('apple', 40, 'a'), item('fish', 10, 'f'),
+  ]), 'fish', 'both cap at 10, so the better food wins the tie');
+});
+
+test('food we did not pick is banked entirely, reserve and all', () => {
+  const bot = new FakeBot(backpack([
+    item('cookedMeat', 11, 'meat'), item('apple', 1, 'apple'),
+    item('fish', 2, 'fish'),
+  ]));
+  // Applying the deposit has to honour `quantity`: a partial stack deposit
+  // leaves the rest in the slot, and a harness that clears the whole slot makes
+  // the chosen food disappear -- which then hands the choice to the next food and
+  // fails for a reason that has nothing to do with the policy.
+  const banked = new Set();
+  for (let i = 0; i < 6; i++) {
+    const n = depot.nextDeposit(bot);
+    if (!n) break;
+    banked.add(n.item.instanceId);
+    const pack = bot.backpack();
+    const qty = n.quantity ?? n.item.quantity ?? 1;
+    pack.contents = pack.contents.map((c) => {
+      if (!c || c.instanceId !== n.item.instanceId) return c;
+      if (qty < (c.quantity || 1)) return { ...c, quantity: c.quantity - qty };
+      return null;
+    });
+  }
+  assert.ok(banked.has('apple'), 'the lone apple is not worth a slot');
+  assert.ok(banked.has('fish'), 'nor two fish when we hold eleven meat');
+  // The meat stays as a stack -- its surplus of 1 is banked, the reserve is not.
+  const left = bot.backpack().contents.filter(Boolean);
+  assert.deepEqual(left.map((c) => [c.itemId, c.quantity]), [['cookedMeat', 10]],
+    'one food type, at its reserve, and nothing else');
+});
+
+test('rawMeat keeps its own reserve for the cooking loop', () => {
+  // rawMeat is not in FOOD_PREFERENCE -- it is haul we happen to be able to
+  // cook -- so the one-food rule must not strip it entirely while cookAndStack
+  // still wants a couple to work on.
+  const bot = new FakeBot(backpack([item('rawMeat', 2, 'raw')]));
+  assert.equal(depot.nextDeposit(bot), null, 'two raw meat is the cooking reserve');
+
+  const lots = new FakeBot(backpack([item('rawMeat', 9, 'raw')]));
+  const next = depot.nextDeposit(lots);
+  assert.equal(next.quantity, 7, '9 held - 2 reserved');
+});
+
+test('the chosen food still banks its own surplus', () => {
+  // Picking one type is not a licence to hoard it: the reserve still applies to
+  // the winner, or a long run would come home with 40 meat and bank nothing.
+  const bot = new FakeBot(backpack([item('cookedMeat', 25, 'meat')]));
+  const next = depot.nextDeposit(bot);
+  assert.equal(next.item.instanceId, 'meat');
+  assert.equal(next.quantity, 15, '25 held - 10 reserved');
+});
+
 test('equipped gear is never banked', () => {
   // nextDeposit walks the BACKPACK, not iterItems() -- which recurses through
   // equipment and would happily stow the sword we are fighting with.

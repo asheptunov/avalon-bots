@@ -132,11 +132,24 @@ export function nearestBox(me) {
 // Consumables we never bank: these are what keep the bot alive on the walk back.
 // Food is not a nicety -- the server only regenerates HP while `wellFed` is up,
 // so a bot that stows its last apple has banked its own regeneration.
+//
+// The TORCH is deliberately absent. It used to be kept, on the reasoning that it
+// is the one item you cannot improvise underground -- but the light source is
+// EQUIPPED, and an equipped torch is not in the backpack, so `nextDeposit` never
+// sees it and banking one was never a risk to it. A torch in the PACK is a spare:
+// 12oz, the heaviest thing on this list by six times, for a slot that could hold
+// haul. Bank it.
 const KEEP_ITEMS = new Set([
   'cookedMeat', 'rawMeat', 'fish', 'cheese', 'apple', 'avocado', 'iceCream',
   'healthPotion', 'largeHealthPotion', 'manaPotion', 'largeManaPotion',
-  'torch',
 ]);
+
+// Food we hold as a real reserve, best-first -- and only ONE of these survives a
+// bank trip (see `foodToKeep`). Ordered by wellFed duration, matching
+// farm.js's FOOD_ITEMS: fish 1200s, cookedMeat 480s, cheese 240s, then the 120s
+// fruit. rawMeat is not here because it is not a keeper in its own right; it has
+// a fixed small reserve below for the cooking loop.
+const FOOD_PREFERENCE = ['fish', 'cookedMeat', 'cheese', 'apple', 'avocado', 'iceCream'];
 
 // How many of each kept consumable to hold back. Anything beyond this is
 // surplus and gets banked.
@@ -144,20 +157,58 @@ const KEEP_ITEMS = new Set([
 // These are the WHOLE policy now that banking empties the pack -- the old
 // weight/slot thresholds are gone, so nothing else stops the trip. Chosen
 // conservatively on purpose: the reserves are cheap in the currency that
-// matters. Every line here totals ~57oz against a 250oz cap, because food is
-// nearly weightless (cookedMeat 2oz, apple 1oz, healthPotion 1oz) and the one
-// genuinely heavy keep is the torch at 12oz -- which is also the one item you
-// cannot improvise underground.
+// matters -- food is nearly weightless (cookedMeat 2oz, apple 1oz, healthPotion
+// 1oz), so the whole list is well under 40oz against a 250oz cap.
 //
 // rawMeat is deliberately LOW where the others are generous: it is haul we
 // happen to be able to cook, it weighs more raw (3oz) than cooked (2oz), and
 // holding ten of it is ten slots of half-value food. Keep a couple for the
 // cooking loop and bank the rest.
 const KEEP_QUANTITY = {
-  cookedMeat: 10, rawMeat: 2, fish: 5, cheese: 5, apple: 10,
-  avocado: 5, iceCream: 5, healthPotion: 5, largeHealthPotion: 5,
-  manaPotion: 5, largeManaPotion: 5, torch: 1,
+  cookedMeat: 10, rawMeat: 2, fish: 10, cheese: 10, apple: 10,
+  avocado: 10, iceCream: 10, healthPotion: 5, largeHealthPotion: 5,
+  manaPotion: 5, largeManaPotion: 5,
 };
+
+/**
+ * Which single food type to keep, given what the pack holds.
+ *
+ * One type is enough. Every food restores regen identically -- only the wellFed
+ * duration differs -- so carrying fish AND cheese AND apples AND avocado AND ice
+ * cream was up to five slots doing one slot's job, and the slot is the scarce
+ * resource on a bank trip. Anything not chosen becomes ordinary haul.
+ *
+ * The choice is the LARGEST STACK, not the best food, because slots are what we
+ * are buying: eleven cooked meat in one slot beats one fish in another, whatever
+ * the durations say. `FOOD_PREFERENCE` breaks ties, so equal stacks keep the
+ * longer-lasting food.
+ *
+ * Counted per itemId across the pack rather than per slot -- split stacks of the
+ * same food merge (cookAndStack does it every tick), so their combined count is
+ * what that food is really worth.
+ */
+export function foodToKeep(contents, keepQty = KEEP_QUANTITY) {
+  const held = new Map();
+  for (const it of contents) {
+    if (!it || it.contents != null) continue;
+    if (!FOOD_PREFERENCE.includes(it.itemId)) continue;
+    held.set(it.itemId, (held.get(it.itemId) || 0) + (it.quantity || 1));
+  }
+  if (!held.size) return null;
+  let best = null;
+  for (const [itemId, n] of held) {
+    // Count toward the decision only what we would actually keep: a stack of 40
+    // apples against a reserve of 10 is worth 10, not 40, and letting the raw
+    // count win would keep the food with the most surplus to bank.
+    const worth = Math.min(n, keepQty[itemId] ?? 0);
+    const rank = FOOD_PREFERENCE.indexOf(itemId);
+    if (!best || worth > best.worth
+        || (worth === best.worth && rank < best.rank)) {
+      best = { itemId, worth, rank };
+    }
+  }
+  return best.itemId;
+}
 
 /**
  * The next item to stow, or null when the pack holds only what we keep.
@@ -190,6 +241,11 @@ export function nextDeposit(bot, keepQty = KEEP_QUANTITY) {
     held.set(it.itemId, (held.get(it.itemId) || 0) + (it.quantity || 1));
   }
 
+  // One food type survives the trip; the rest are haul. Resolved once here
+  // rather than per item so every slot is judged against the same winner --
+  // deciding per item would keep whichever food each comparison happened to see.
+  const food = foodToKeep(contents, keepQty);
+
   for (const it of contents) {
     if (!it) continue;                             // empty slot
     if (skip?.has(it.instanceId)) continue;        // already refused this trip
@@ -202,6 +258,12 @@ export function nextDeposit(bot, keepQty = KEEP_QUANTITY) {
       continue;
     }
     if (!KEEP_ITEMS.has(it.itemId)) return { item: it };
+    // A food we did not pick is haul, reserve and all -- that is the whole point
+    // of choosing one type. rawMeat is exempt: it is not in FOOD_PREFERENCE and
+    // keeps its own small reserve for the cooking loop.
+    if (FOOD_PREFERENCE.includes(it.itemId) && it.itemId !== food) {
+      return { item: it };
+    }
     // A kept consumable: bank only the amount above the reserve, and only when
     // this single stack is what pushes us over -- partial deposits use the
     // `quantity` field moveItem already supports.
