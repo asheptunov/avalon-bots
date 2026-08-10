@@ -220,6 +220,67 @@ test('an orc in the same room is still chased normally', () => {
   });
 });
 
+// ---- prey down a long detour ----------------------------------------------
+//
+// "Reachable" is not the same as "worth walking to". The reach check above only
+// asks whether a path EXISTS, so an orc a few tiles away through a wall, whose
+// only route is the long way around, is still committed to. Measured on the real
+// z=-1 map standing at 33,86 with an orc at 22,81: 12 tiles apart in a straight
+// line, an 80-tile path -- a 6.6x detour that takes 82 SECONDS to walk while the
+// bot marches away from prey it appears to be facing. It always arrives, so this
+// is not the hard freeze fixed above; from the outside it reads the same way,
+// which is exactly why it survived that fix.
+//
+// `roamPx` (12 tiles) is what the bot is willing to range for a target, so a
+// path several times longer than that is prey for a different patch of cave.
+
+/**
+ * One wall, with the only doorway at the far south end -- a long way round.
+ * Tall on purpose: the detour has to beat the 36-tile budget (roamPx 12 tiles x
+ * MAX_CHASE_DETOUR 3), and a short map cannot express one.
+ */
+const detourMap = (w = 24, h = 34, wx = 12) => {
+  const rows = [];
+  for (let y = 0; y < h; y++) {
+    let r = '';
+    for (let x = 0; x < w; x++) {
+      const edge = y === 0 || y === h - 1 || x === 0 || x === w - 1;
+      // The gap sits at the bottom row of open floor, so crossing near the top
+      // means walking the full height of the map twice.
+      const wall = x === wx && y !== h - 2;
+      r += (edge || wall) ? '#' : '.';
+    }
+    rows.push(r);
+  }
+  return rows;
+};
+
+test('an orc reachable only by a huge detour is left for another patch', () => {
+  onMap(detourMap(), () => {
+    const bot = new FakeBot(backpack([]));
+    // Orc is ~4 tiles east in a straight line, but the only doorway is 10 rows
+    // south, so the real path is several times the bot's roam radius.
+    const snap = snapshot([me([10, 2])], [rat([14, 2], 40, 'orc1', 'orc')]);
+    run(bot, snap, hunting());
+    assert.equal(stateOf(bot), 'ROAM',
+      'prey down a 5x detour should be dropped, not marched at for a minute');
+    const moves = bot.ofType('move').filter((m) => m.dx || m.dy);
+    assert.ok(moves.length > 0, 'and it must still be moving, not frozen');
+  });
+});
+
+test('a long but sane walk to prey is still taken', () => {
+  onMap(splitMap(30, 12, 29), () => {
+    const bot = new FakeBot(backpack([]));
+    // Same room, no wall between: 10 tiles of clear floor is a normal chase and
+    // must not be mistaken for a detour just because it is far.
+    const snap = snapshot([me([3, 5])], [rat([13, 5], 40, 'orc1', 'orc')]);
+    run(bot, snap, hunting());
+    assert.equal(stateOf(bot), 'FIGHT',
+      'the detour cap keys off PATH length, not raw distance');
+  });
+});
+
 // Self-defense outranks the reach check: a monster landing hits on us is
 // reachable by definition, whatever A* thinks of the tile it stands on. Without
 // this ordering the fix would create a NEW freeze -- ignoring the thing eating us.

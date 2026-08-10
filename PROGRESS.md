@@ -8,6 +8,59 @@ bot characters (leader + escorts) to navigate and kill monsters together.
 
 ---
 
+## 2026-08-09 — the corner "freeze" that was really a 6.6x detour (v0.11.2)
+
+**Sam reported the v0.11.1 fix helped but did not finish the job**: still
+intermittent freezes while walking toward a faraway orc, still sticking on one
+corner. Both were real, and neither was the bug v0.11.1 fixed.
+
+**It was not a freeze at all — he moved on 400 of 400 ticks.** Traced one case on
+the real z=-1 map: standing at 33,86 with an orc at 22,81, he walks **east, away
+from an orc sitting to his west**, for 82 seconds. A* is not confused — the path
+is valid and its length ticks down 80→79→78. The two are 12 tiles apart in a
+straight line and **80 tiles apart by path**: a 6.6x detour around a wall. He
+always arrives. From the outside that is indistinguishable from being stuck,
+which is exactly how it survived the last fix.
+
+The v0.11.1 reach check asked *"does a path exist?"* and never *"how long is
+it?"*. Two fixes:
+
+1. **`MAX_CHASE_DETOUR` (3.0x `roamPx`).** `findPath` already returns the tiles,
+   so the length is free — cap it. Prey down a longer walk is prey for a
+   different patch of cave, and it now logs `UNREACHABLE` and roams instead.
+   Deliberately loose: an honest corner costs more than the straight line, and
+   the sweep found legitimate chases up to 2.8x, so a tighter cap would start
+   refusing real fights.
+2. **`ROAM_MIN_TILES` (5).** Found while checking the first fix did not just move
+   the problem into ROAM — one site covered **11 tiles in 120 seconds**. Cause:
+   the roam filter tested "can I take a step toward this goal", which is not "does
+   this goal go anywhere". A goal landing in rock gets snapped by
+   `nearestWalkable` onto the nearest open tile, which at a pocket edge is two
+   tiles away. Measured: **every one of 2000 sampled goals passed the step test,
+   yet the median was 3 tiles off and 59% were within 3.** Also fixed the scoring
+   — when alone every candidate scored 0 against a `-Infinity` best, so the
+   *first* sample always won and the other seven were wasted work. Path length is
+   now the tie-breaker.
+
+**Measured.** Worst roam stall 11 tiles/3.9 away → **55 tiles/28.5 away**; z=-2
+24 → 80 tiles. Freeze sweep still **0 frozen across 1009 situations**. Suite 353.
+
+**Throughput is unchanged: 5.74 vs 5.73 kills/min** (A/B with both constants
+neutralised). With 10+ spawns a floor there is essentially always a closer orc,
+so declining the long walk costs nothing. Getting that number honest took three
+harness rewrites — the first two read 59.7 and 599.95 kills/min *identically on
+both builds*, because the bot spent 159 of 200 ticks swinging and then, once
+respawn-at-home was added, re-killed the same corpse under its feet every tick.
+A metric that cannot separate the builds is not evidence; the respawn timer is
+what finally made travel time dominate.
+
+**Rejected on evidence:** ranking prey by path length instead of pixels. Sounds
+right, but nearest-by-pixel disagrees with nearest-by-path in only **5.7% of 1851
+situations, median 1.0x and worst 2.8x extra walking** — the mispick is not what
+hurts. The absolute detour is, and it happens with only one orc in view.
+
+---
+
 ## 2026-08-09 — the bot stops freezing at corners in the orc cave (v0.11.1)
 
 **The symptom.** Dario locks onto an orc some distance off, never moves, and
